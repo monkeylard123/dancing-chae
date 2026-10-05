@@ -35,7 +35,6 @@ BATCH = 0.1         # the phone sends a sensor batch about every 0.1 s; its samp
 LAG = 0.12          # play the motion back this far behind real time, so a batch is always there to play
 FRESH = 0.6         # motion data older than this (s) is ignored: the phone page stopped sending
 FIDGET = 0.35       # standing still but moving this much (energy) makes him shuffle on the spot
-FACE_BACK = 1.5     # after Chae pivots, he eases back to facing you over about this many seconds
 TURN_STEP = 15      # turning is drawn in steps of this many degrees
 LOCK_VK = 0x50      # Ctrl+Alt+P (WalkPad's stats overlay uses L/H/Q, so they can run side by side)
 
@@ -82,7 +81,7 @@ class Walker:
         self.listeners, self.chae = 0, None          # chae: is Chae's WalkPad connected to the server (None = not told yet)
         self.names = []                              # listener names in join order ("" = didn't give one)
         self.motion = deque()                        # (time, sample / step threshold) from the phone's sensor batches
-        self.heading, self.facing_base, self.turn_at = None, None, None   # Chae's turning, from the phone's gyro
+        self.heading, self.turn_at = None, None      # Chae's direction from the phone's gyro (0 = the way he faced at Start)
 
     def set_online(self, on):
         """Whether WE are connected to the listen feed."""
@@ -138,21 +137,16 @@ class Walker:
         return True
 
     def turning(self, heading, now):
-        """Chae's heading (degrees turned since he started, clockwise from above; only the /phone page sends it).
-        He shows turns, not the direction Chae walks: facing_base follows the heading a little behind, and the
-        difference between them is how far he's turned away from you, which eases back to 0 once Chae stops turning."""
+        """Chae's heading: degrees turned since he tapped Start (or Reset) on the /phone page, clockwise from above.
+        The way he faced then is "forward", which is facing you; the heading is how far he's turned from it."""
         if not isinstance(heading, (int, float)) or isinstance(heading, bool) or not math.isfinite(heading): return
-        if self.heading is None or self.turn_at is None or now - self.turn_at > FRESH:
-            self.facing_base = heading                                # (re)start facing you
-        else:
-            dt = max(0.0, now - self.turn_at)
-            self.facing_base += wrap(heading - self.facing_base) * (1 - math.exp(-dt / FACE_BACK))
         self.heading, self.turn_at = heading, now
 
     def facing(self, now):
-        """How far he's turned away from you (-180..180 degrees, + = to his right), or 0 without fresh gyro data."""
+        """How far he's turned away from you (-180..180 degrees, + = to his right): Chae's direction relative to how
+        he faced at Start. 0 (facing you) without fresh gyro data."""
         if self.heading is None or self.turn_at is None or now - self.turn_at > FRESH: return 0.0
-        return wrap(self.heading - self.facing_base)
+        return wrap(self.heading)
 
     def signal(self, now):
         """The motion sample playing right now (about 1 at a step peak), or 0 without fresh data."""

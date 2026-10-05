@@ -272,21 +272,28 @@ def test_the_feed_says_hello_with_your_name():
 def turn_batch(heading): return {"type": "sensor", "data": {"samples": [0.0] * 6, "threshold": 0.7, "heading": heading, "turn_rate": 0}}
 
 
-def test_a_pivot_turns_him_then_he_faces_you_again():
+def test_he_faces_you_the_way_chae_faced_at_start_and_keeps_chaes_direction():
     w = walker.Walker(); w.set_online(True)
-    for k in range(10): w.feed(turn_batch(10.0), k / 10)                 # standing still, heading steady
-    assert w.facing(0.95) == 0
-    for k in range(10): w.feed(turn_batch(10 + 18 * (k + 1)), 1 + k / 10)   # a quick 180 to the right in 1 s
-    assert 60 < w.facing(1.95) <= 180
-    for k in range(60): w.feed(turn_batch(190.0), 2 + k / 10)            # then stands still for 6 s
-    assert abs(w.facing(7.95)) < 10
+    w.feed(turn_batch(0.0), 0); assert w.facing(0.05) == 0                # Start: forward = facing you
+    for k in range(10): w.feed(turn_batch(18.0 * (k + 1)), 0.1 * (k + 1))  # Chae turns around (180 to the right)
+    assert w.facing(1.05) == -180 or w.facing(1.05) == 180
+    for k in range(60): w.feed(turn_batch(180.0), 1.1 + k / 10)           # ...and keeps walking that way
+    assert abs(w.facing(7.05)) == 180                                     # he keeps showing his back
+    w.feed(turn_batch(90.0), 7.1); assert w.facing(7.15) == 90            # turns back halfway: side-on
+    w.feed(turn_batch(0.0), 7.2); assert w.facing(7.25) == 0              # facing forward again (or after Reset)
+
+
+def test_joining_mid_walk_shows_chaes_current_direction():
+    w = walker.Walker(); w.set_online(True)
+    w.feed(turn_batch(270.0), 50)                                         # Chae turned left 90 before we connected
+    assert w.facing(50.05) == -90
 
 
 def test_turning_left_is_negative_and_wraps_around_360():
     w = walker.Walker(); w.set_online(True)
     w.feed(turn_batch(5.0), 0)
     for k in range(5): w.feed(turn_batch((5 - 15 * (k + 1)) % 360), 0.1 * (k + 1))   # crosses 0 -> 350, 335, ...
-    assert -90 < w.facing(0.5) < -20
+    assert w.facing(0.55) == -70
 
 
 def test_turn_shows_in_the_drawing_details_and_goes_stale():
