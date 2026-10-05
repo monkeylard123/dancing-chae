@@ -14,7 +14,7 @@ Ctrl+Alt+P locks/unlocks him; a locked walker is click-through.
 
 The sprite art lives in walker_sprites.py. Only needs tkinter and aiohttp (see requirements.txt).
 """
-import argparse, asyncio, ctypes, json, logging, logging.handlers, os, queue, sys, threading, time
+import argparse, asyncio, ctypes, json, logging, logging.handlers, math, os, queue, sys, threading, time
 from collections import OrderedDict, deque
 
 import walker_sprites as sprites
@@ -35,6 +35,8 @@ BATCH = 0.1         # the phone sends a sensor batch about every 0.1 s; its samp
 LAG = 0.12          # play the motion back this far behind real time, so a batch is always there to play
 FRESH = 0.6         # motion data older than this (s) is ignored: the phone page stopped sending
 FIDGET = 0.35       # standing still but moving this much (energy) makes him shuffle on the spot
+FACE_BACK = 1.5     # after Chae pivots, he eases back to facing you over about this many seconds
+TURN_STEP = 15      # turning is drawn in steps of this many degrees
 LOCK_VK = 0x50      # Ctrl+Alt+P (WalkPad's stats overlay uses L/H/Q, so they can run side by side)
 
 
@@ -80,11 +82,13 @@ class Walker:
         self.listeners, self.chae = 0, None          # chae: is Chae's WalkPad connected to the server (None = not told yet)
         self.names = []                              # listener names in join order ("" = didn't give one)
         self.motion = deque()                        # (time, sample / step threshold) from the phone's sensor batches
+        self.heading, self.facing_base, self.turn_at = None, None, None   # Chae's turning, from the phone's gyro
 
     def set_online(self, on):
         """Whether WE are connected to the listen feed."""
         self.online = on
-        if not on: self.listeners, self.chae, self.names = 0, None, []; self.motion.clear()   # unknown until told again
+        if not on:                                                    # unknown until the server tells us again
+            self.listeners, self.chae, self.names = 0, None, []; self.motion.clear(); self.heading = None
 
     def status(self, m):
         """The server's ConnectionMessage {"type": "connection", "data": {"connected": bool}} and ListenerCountMessage
@@ -119,7 +123,8 @@ class Walker:
         "v": [...], "thr": t}). Samples are the phone's acceleration signal; dividing by the step threshold makes a
         typical step peak about 1. Returns True if m was one."""
         if not isinstance(m, dict): return False
-        if m.get("type") == "sensor" and isinstance(m.get("data"), dict): v, thr = m["data"].get("samples"), m["data"].get("threshold")
+        if m.get("type") == "sensor" and isinstance(m.get("data"), dict):
+            v, thr = m["data"].get("samples"), m["data"].get("threshold"); self.turning(m["data"].get("heading"), now)
         elif m.get("t") == "sig": v, thr = m.get("v"), m.get("thr")
         else: return False
         v = [x for x in v if isinstance(x, (int, float)) and not isinstance(x, bool)] if isinstance(v, list) else []
@@ -131,6 +136,23 @@ class Walker:
         for k, x in enumerate(v): self.motion.append((start + k * BATCH / len(v), x / thr))
         while self.motion and self.motion[0][0] < now - 2: self.motion.popleft()
         return True
+
+    def turning(self, heading, now):
+        """Chae's heading (degrees turned since he started, clockwise from above; only the /phone page sends it).
+        He shows turns, not the direction Chae walks: facing_base follows the heading a little behind, and the
+        difference between them is how far he's turned away from you, which eases back to 0 once Chae stops turning."""
+        if not isinstance(heading, (int, float)) or isinstance(heading, bool) or not math.isfinite(heading): return
+        if self.heading is None or self.turn_at is None or now - self.turn_at > FRESH:
+            self.facing_base = heading                                # (re)start facing you
+        else:
+            dt = max(0.0, now - self.turn_at)
+            self.facing_base += wrap(heading - self.facing_base) * (1 - math.exp(-dt / FACE_BACK))
+        self.heading, self.turn_at = heading, now
+
+    def facing(self, now):
+        """How far he's turned away from you (-180..180 degrees, + = to his right), or 0 without fresh gyro data."""
+        if self.heading is None or self.turn_at is None or now - self.turn_at > FRESH: return 0.0
+        return wrap(self.heading - self.facing_base)
 
     def signal(self, now):
         """The motion sample playing right now (about 1 at a step peak), or 0 without fresh data."""
@@ -150,14 +172,17 @@ class Walker:
         now = time.time() if now is None else now
         pose, i = self.frame(now)
         e, sig = self.energy(now), self.signal(now)
-        if pose == "sleep" or e is None: return pose, i, ()
+        if pose == "sleep": return pose, i, ()
+        turn = round(self.facing(now) / TURN_STEP) * TURN_STEP
+        turn = (("turn", turn),) if turn else ()
+        if e is None: return pose, i, turn
         bob = max(-2, min(2, round(sig * 2)))                         # his body follows the phone's bounce
         if pose == "idle":
             fidget = (1 if int(now * 4) % 2 else -1) if e > FIDGET else 0
-            return pose, i, (("bob", bob), ("fidget", fidget))
+            return pose, i, (("bob", bob), ("fidget", fidget)) + turn
         e = min(e, 1.5) / 1.5                                         # 0 = barely moving .. 1 = stomping
         base = 2 if pose == "walk" else 4
-        return pose, i, (("stride", base + round(4 * e)), ("arms", base // 2 + round(4 * e)), ("bob", bob))
+        return pose, i, (("stride", base + round(4 * e)), ("arms", base // 2 + round(4 * e)), ("bob", bob)) + turn
 
     def feed(self, m, now=None):
         now = time.time() if now is None else now
@@ -189,6 +214,11 @@ class Walker:
         now = time.time() if now is None else now
         p = self.pose(now)
         return p, int(now * FPS[p]) % sprites.PHASES[p]
+
+
+def wrap(deg):
+    """An angle difference brought into -180..180."""
+    return (deg + 180) % 360 - 180
 
 
 # ---------------------------------------------------------------- data sources
@@ -270,17 +300,20 @@ class Feed(threading.Thread):
 
 
 class Demo(threading.Thread):
-    """Fake data: idle, walk, run, idle, then Chae disconnects (nap), repeating. Sends phone motion too."""
+    """Fake data: idle (with a full pivot), walk, run, idle, then Chae disconnects (nap), repeating. Sends phone motion too."""
     def __init__(self, q): super().__init__(daemon=True); self.q = q
 
-    def motion(self, gap, strength, secs):
-        """Sensor batches every 0.1 s for secs: a bump per step (or a little sway while standing)."""
-        import math
+    heading = 0.0
+
+    def motion(self, gap, strength, secs, spin=0.0):
+        """Sensor batches every 0.1 s for secs: a bump per step (or a little sway while standing), turning at spin deg/s."""
         for b in range(max(1, round(secs / BATCH))):
+            self.heading = (self.heading + spin * BATCH) % 360
             t0 = time.time()
             if gap: v = [strength * 0.9 * math.sin(math.pi * 2 * (t0 + k * BATCH / 6) / gap) for k in range(6)]
             else: v = [0.12 * math.sin(t0 * 3 + k * 0.1) for k in range(6)]
-            self.q.put(("msg", {"type": "sensor", "data": {"samples": [round(x, 2) for x in v], "rejected": 0, "threshold": 1.0}}))
+            self.q.put(("msg", {"type": "sensor", "data": {"samples": [round(x, 2) for x in v], "rejected": 0, "threshold": 1.0,
+                                                           "heading": round(self.heading, 1), "turn_rate": spin}}))
             time.sleep(BATCH)
 
     def run(self):
@@ -297,7 +330,8 @@ class Demo(threading.Thread):
                         steps += 1
                         self.q.put(("msg", {"type": "step", "data": {"step": steps, "gap": gap, "speed": speed, "out": speed,
                                                                      "source": "phone"}}))
-                    self.motion(gap, 1.4 if gap and gap < 0.4 else 1.0, gap or 0.5)
+                    first_idle = gap is None and secs == 3 and time.time() < end - 1.5
+                    self.motion(gap, 1.4 if gap and gap < 0.4 else 1.0, gap or 0.5, 360 if first_idle else 0)   # a full pivot
             self.q.put(("msg", {"type": "connection", "data": {"connected": False}})); time.sleep(6)
 
 

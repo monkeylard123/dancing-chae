@@ -266,3 +266,48 @@ def test_the_feed_says_hello_with_your_name():
         return got
 
     assert asyncio.run(scenario())[:2] == [{"type": "hello", "name": "Alex"}, {"type": "hello", "name": "Big Nick"}]
+
+
+# ---------- turning (gyro heading from the /phone page) ----------
+def turn_batch(heading): return {"type": "sensor", "data": {"samples": [0.0] * 6, "threshold": 0.7, "heading": heading, "turn_rate": 0}}
+
+
+def test_a_pivot_turns_him_then_he_faces_you_again():
+    w = walker.Walker(); w.set_online(True)
+    for k in range(10): w.feed(turn_batch(10.0), k / 10)                 # standing still, heading steady
+    assert w.facing(0.95) == 0
+    for k in range(10): w.feed(turn_batch(10 + 18 * (k + 1)), 1 + k / 10)   # a quick 180 to the right in 1 s
+    assert 60 < w.facing(1.95) <= 180
+    for k in range(60): w.feed(turn_batch(190.0), 2 + k / 10)            # then stands still for 6 s
+    assert abs(w.facing(7.95)) < 10
+
+
+def test_turning_left_is_negative_and_wraps_around_360():
+    w = walker.Walker(); w.set_online(True)
+    w.feed(turn_batch(5.0), 0)
+    for k in range(5): w.feed(turn_batch((5 - 15 * (k + 1)) % 360), 0.1 * (k + 1))   # crosses 0 -> 350, 335, ...
+    assert -90 < w.facing(0.5) < -20
+
+
+def test_turn_shows_in_the_drawing_details_and_goes_stale():
+    w = walker.Walker(); w.set_online(True); w.feed(STEP, 0)
+    w.feed(turn_batch(0.0), 0); w.feed(turn_batch(90.0), 0.1)
+    turn = dict(w.look(0.15)[2]).get("turn")
+    assert turn and turn % walker.TURN_STEP == 0 and turn > 0
+    assert "turn" not in dict(w.look(5)[2]) and w.facing(5) == 0
+
+
+def test_bad_headings_are_ignored():
+    w = walker.Walker(); w.set_online(True)
+    for h in ("90", None, True, float("nan"), float("inf")): w.feed(turn_batch(h), 0)
+    assert w.heading is None and w.facing(0) == 0
+
+
+def test_turned_frames_stay_full_size_and_show_his_back():
+    front, back = sprites.pick("walk", 1, turn=0), sprites.pick("walk", 1, turn=180)
+    assert front != back
+    for a in (15, 45, 90, 135, 180, -45, -165):
+        check(list(sprites.pick("walk", 1, turn=a)), sprites.W, sprites.H)
+        check(list(sprites.pick("idle", 0, turn=a)), sprites.W, sprites.H)
+    side = sprites.pick("idle", 0, turn=90)
+    assert max(len(r.strip(".")) for r in side) < 10                      # edge-on he's a sliver

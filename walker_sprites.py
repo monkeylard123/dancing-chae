@@ -103,9 +103,10 @@ def text(g, s, x, y, c):
         x += len(GLYPHS[ch][0]) + 1
 
 
-def paint(lift=(0, 0), bob=0, swing=0, shut=False, sit=False):
+def paint(lift=(0, 0), bob=0, swing=0, shut=False, sit=False, back=False):
     """One frame. lift: how far each foot is raised (yours-left, yours-right). bob: upper body up (+) / down (-).
-    swing: hands move opposite ways. shut: eyes closed. sit: sitting on the floor (for the nap)."""
+    swing: hands move opposite ways. shut: eyes closed. sit: sitting on the floor (for the nap).
+    back: seen from behind (for turning around): back of the head and cap, no face, plain shirt back."""
     g = Grid()
     dy = 15 - bob if sit else -bob                        # everything above the hips moves by dy
     Y = lambda y: y + dy
@@ -129,22 +130,35 @@ def paint(lift=(0, 0), bob=0, swing=0, shut=False, sit=False):
 
     # ---- torso, open laced collar
     g.fill(ellipse(32, Y(70), 19, 8, lambda x, y: y <= Y(70)) + rect(14, Y(70), 49, Y(89)), "t")
-    collar = [(x, Y(62) + i) for i in range(12) for x in range(32 - max(1, 6 - i // 2), 32 + max(1, 6 - i // 2))]
-    g.fill(collar, lambda x, y: "B" if noise(x, y, 3) < 40 else "b")
-    for i, yy in enumerate((64, 68, 72)):
-        a, b = (25 + i, Y(yy)), (38 - i, Y(yy))
-        g.set(*a, "O"); g.set(*b, "O")
-        if i < 2: line(g, (a[0] + 1, a[1]), (36 - i, Y(yy + 4)), "T"); line(g, (b[0] - 1, b[1]), (27 + i, Y(yy + 4)), "T")
-    line(g, (32, Y(75)), (32, Y(86)), "k")
+    if back:                                                         # plain back with a collar line and a centre seam
+        line(g, (24, Y(63)), (39, Y(63)), "T"); line(g, (32, Y(66)), (32, Y(86)), "T")
+    else:
+        collar = [(x, Y(62) + i) for i in range(12) for x in range(32 - max(1, 6 - i // 2), 32 + max(1, 6 - i // 2))]
+        g.fill(collar, lambda x, y: "B" if noise(x, y, 3) < 40 else "b")
+        for i, yy in enumerate((64, 68, 72)):
+            a, b = (25 + i, Y(yy)), (38 - i, Y(yy))
+            g.set(*a, "O"); g.set(*b, "O")
+            if i < 2: line(g, (a[0] + 1, a[1]), (36 - i, Y(yy + 4)), "T"); line(g, (b[0] - 1, b[1]), (27 + i, Y(yy + 4)), "T")
+        line(g, (32, Y(75)), (32, Y(86)), "k")
 
     # ---- neck, ears, head
     g.fill(rect(25, Y(56), 38, Y(63)), lambda x, y: "B" if noise(x, y, 4) < 50 else "b")
     for cx in (15.5, 48.5):
         g.fill(ellipse(cx, Y(41), 3.2, 5.5), lambda x, y, cx=cx: "S" if abs(x + .5 - cx) < 1.2 else "s")
     head = set(ellipse(32, Y(41), 16, 17) + ellipse(32, Y(49), 15, 11))
-    g.fill(head, "s")
-    g.fill(ellipse(48.5, Y(39), 1.6, 2.6), "u", line=False)                               # blue earpiece
-    for x, y in ((48, Y(46)), (47, Y(47)), (49, Y(47)), (48, Y(48))): g.set(x, y, "o")   # gold earring
+    ear = 15.5 if back else 48.5                                      # his left ear: on your right from the front
+    if back:                                                          # back of the head: hair down to the nape, then neck
+        g.fill(head, lambda x, y: ("k" if noise(x, y, 7) < 12 else "h") if y <= Y(52) else stubble(x, y))
+    else:
+        g.fill(head, "s")
+    g.fill(ellipse(ear, Y(39), 1.6, 2.6), "u", line=False)                                # blue earpiece
+    e = int(ear)
+    for x, y in ((e, Y(46)), (e - 1, Y(47)), (e + 1, Y(47)), (e, Y(48))): g.set(x, y, "o")   # gold earring
+    if back:
+        g.fill(ellipse(32, Y(25), 18.5, 15, lambda x, y: y <= Y(25)), camo)               # cap crown, no lettering
+        g.fill([(x, y) for x, y in ellipse(32, Y(26), 4, 3.5) if y <= Y(25)], "h")          # opening at the back
+        line(g, (27, Y(23)), (37, Y(23)), "d"); g.set(32, Y(23), "r")                      # strap and buckle
+        return g.rows()
     g.fill([(x, y) for x, y in head if (x < 19 or x > 44) and Y(28) <= y <= Y(44)], "h", line=False)   # sideburns
     g.fill([(x, y) for x, y in head if y >= Y(46) or ((x < 21 or x > 42) and y >= Y(42))], stubble, line=False)
     g.fill([(x, y) for x, y in head if y >= Y(55)], lambda x, y: "B" if noise(x, y, 5) < 60 else "b", line=False)
@@ -186,19 +200,33 @@ PHASES = {"idle": 8, "walk": 4, "run": 4, "sleep": 2}
 DEFAULT_DETAIL = {"walk": {"stride": 3, "arms": 2}, "run": {"stride": 6, "arms": 4}}
 
 
+def turned(rows, angle):
+    """He turns like a paper cut-out: angle 0 faces you, +-90 is edge-on, beyond that you see his back (rows must
+    already be the back view then). He narrows by |cos(angle)| and slides a little the way he's turning."""
+    f = abs(math.cos(math.radians(angle)))
+    w = max(4, round(W * f))
+    left = max(0, min(W - w, (W - w) // 2 - round(3 * math.sin(math.radians(angle)))))
+    return [("." * left + "".join(r[min(W - 1, int((x + .5) * W / w))] for x in range(w))).ljust(W, ".") for r in rows]
+
+
 @lru_cache(maxsize=2048)
-def pick(pose, i, stride=None, arms=None, bob=0, fidget=0):
-    """The frame (tuple of rows) for animation phase i of pose, with optional live detail."""
+def pick(pose, i, stride=None, arms=None, bob=0, fidget=0, turn=0):
+    """The frame (tuple of rows) for animation phase i of pose, with optional live detail.
+    turn: degrees he's turned away from you (-180..180, + = his right), from Chae's pivots."""
     if pose == "sleep": return tuple(paint(sit=True, shut=True, bob=-(i % 2)))           # breathing
-    if pose == "idle": return tuple(paint(bob=bob, swing=fidget, shut=i == 6))           # phase 6 blinks
-    d = DEFAULT_DETAIL[pose]
-    stride, arms = d["stride"] if stride is None else stride, d["arms"] if arms is None else arms
-    side = 1 if i < 2 else -1                                                            # which foot is stepping
-    if pose == "walk":                                                                   # stand, step, stand, other step
-        up_, b, sw = (stride, 1, arms) if i % 2 else (0, 0, 0)
-    else:                                                                                # run: push off high, then land
-        up_, b, sw = (stride, 2, arms) if i % 2 == 0 else (max(1, stride // 3), 0, arms // 3)
-    return tuple(paint(lift=(up_, 0) if side > 0 else (0, up_), bob=b + bob, swing=sw * side))
+    back = abs(turn) > 90
+    if pose == "idle": kw = dict(bob=bob, swing=fidget, shut=i == 6)                     # phase 6 blinks
+    else:
+        d = DEFAULT_DETAIL[pose]
+        stride, arms = d["stride"] if stride is None else stride, d["arms"] if arms is None else arms
+        side = 1 if i < 2 else -1                                                        # which foot is stepping
+        if pose == "walk":                                                               # stand, step, stand, other step
+            up_, b, sw = (stride, 1, arms) if i % 2 else (0, 0, 0)
+        else:                                                                            # run: push off high, then land
+            up_, b, sw = (stride, 2, arms) if i % 2 == 0 else (max(1, stride // 3), 0, arms // 3)
+        kw = dict(lift=(up_, 0) if side > 0 else (0, up_), bob=b + bob, swing=sw * side)
+    rows = paint(back=back, **kw)
+    return tuple(turned(rows, turn) if turn else rows)
 
 
 STAND = list(pick("idle", 0))

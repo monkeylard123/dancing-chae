@@ -10,6 +10,7 @@ driven live by the step feed from [WalkPad (moovit)](https://github.com/chaepr/m
 | steps are arriving fast (`speed` above WalkPad's `walk_max`, 0.65 by default) | runs |
 | no step for 1.2 s | stands around, blinking now and then |
 | Chae shuffles or sways without a counted step | bobs and fidgets on the spot |
+| Chae pivots or turns around (phone's gyro, from the `/phone` page) | spins round like a paper cut-out, showing his back past 90 degrees, then turns back to face you |
 | Chae is disconnected from the server (or he can't reach the server) | sits down for a nap, with z's rising |
 | people are listening (you included) | a little audience gathers to his left and cheers while he moves (10 fans, then `+N`), each labelled with the name they gave; yours is gold |
 
@@ -34,7 +35,7 @@ Press Ctrl+Alt+P again to unlock him. Your name, position and size are saved to 
 ```bash
 pip install -r requirements.txt
 python walker.py                              # live feed
-python walker.py --demo                       # fake data: idle, walk, run, nap, with motion and a growing audience
+python walker.py --demo                       # fake data: a pivot, walk, run, nap, with motion and a growing audience
 python walker.py --scale 3                    # bigger (1 to 6, default 2)
 python walker.py --server https://other.host  # another Chae WebSocket server (found through its openapi.json)
 python walker.py --reset                      # forget the saved position and size
@@ -82,6 +83,10 @@ Messages he uses (schemas in `openapi.json`):
   * the last second's energy sets how high his feet lift and how far his arms swing, from soft steps to stomping
   * moving without a counted step makes him fidget on the spot
   * with no fresh samples (phone page closed) he falls back to his standard animation
+* the `/phone` page's sensor messages also carry `heading` (degrees turned since Start, clockwise seen from above)
+  and `turn_rate`, from the phone's gyroscope. He shows **turns**, not the direction Chae walks in: he turns away from
+  you by however far Chae pivots, then eases back to facing you over about a second and a half. A full 360 is a full
+  spin. Without heading data he always faces you.
 * anything else is ignored.
 
 ## Changing how he looks
