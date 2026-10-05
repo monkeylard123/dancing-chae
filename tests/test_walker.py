@@ -147,3 +147,72 @@ def test_locking_makes_him_click_through_and_unlocking_undoes_it():
     w.click_through(77, False)
     assert not u.style & w.TRANSPARENT and not u.style & w.NOACTIVATE and u.style & w.LAYERED
     u.keys = {walker.LOCK_VK}; assert w.key_down(walker.LOCK_VK) and not w.key_down(0x11)
+
+
+# ---------- live motion detail from the phone's sensor stream ----------
+def sensor(samples, thr=0.7): return {"type": "sensor", "data": {"samples": samples, "rejected": 0, "threshold": thr}}
+
+
+def shake(w, start, secs, amp, thr=0.7):
+    """Feed sensor batches every 0.1 s like the phone does."""
+    for b in range(int(secs * 10)): w.feed(sensor([amp * (1 if k % 2 else -1) for k in range(6)], thr), start + b / 10)
+
+
+def test_sensor_messages_are_motion_not_steps():
+    w = walker.Walker(); w.set_online(True)
+    shake(w, 0, 1, 0.7)
+    assert w.last_step is None and w.pose(1) == "idle" and len(w.motion) == 60
+
+
+def test_no_sensor_data_means_the_default_look():
+    w = walker.Walker(); w.set_online(True); w.feed(STEP, 0)
+    pose, i, detail = w.look(0.2)
+    assert pose == "walk" and detail == () and sprites.pick(pose, i) == tuple(sprites.FRAMES[pose][i])
+
+
+def test_harder_motion_means_longer_strides_and_bigger_arm_swings():
+    def detail(amp):
+        w = walker.Walker(); w.set_online(True); shake(w, 0, 1.5, amp); w.feed(STEP, 1.4)
+        return dict(w.look(1.5)[2])
+    soft, hard = detail(0.15), detail(1.2)
+    assert soft["stride"] < hard["stride"] and soft["arms"] < hard["arms"]
+    assert 2 <= soft["stride"] and hard["stride"] <= 6
+
+
+def test_his_body_follows_the_phone_bounce():
+    w = walker.Walker(); w.set_online(True)
+    shake(w, 0, 1, 0.1); w.feed(sensor([1.4] * 6), 1.0)                  # a big push, threshold-sized and more
+    assert dict(w.look(1.0 + walker.LAG + 0.01)[2])["bob"] == 2
+    w.feed(sensor([-1.4] * 6), 1.1)
+    assert dict(w.look(1.1 + walker.LAG + 0.01)[2])["bob"] == -2
+
+
+def test_shuffling_without_a_counted_step_makes_him_fidget():
+    w = walker.Walker(); w.set_online(True)
+    shake(w, 0, 1.2, 0.5)                                                 # moving, but no step message
+    pose, i, detail = w.look(1.2)
+    assert pose == "idle" and dict(detail)["fidget"] in (-1, 1)
+    w2 = walker.Walker(); w2.set_online(True); shake(w2, 0, 1.2, 0.05)
+    assert dict(w2.look(1.2)[2])["fidget"] == 0
+
+
+def test_motion_goes_stale_when_the_phone_stops_sending():
+    w = walker.Walker(); w.set_online(True); shake(w, 0, 1, 1.0)
+    assert w.look(1.0)[2] != () and w.look(5.0)[2] == () and w.signal(5.0) == 0
+
+
+def test_bad_sensor_batches_are_harmless():
+    w = walker.Walker(); w.set_online(True)
+    for m in (sensor("x"), sensor([None, True, "1", 0.5]), sensor([0.5], thr=0), {"type": "sensor", "data": None},
+              {"t": "sig", "v": [0.2, 0.3], "thr": 0.7}):
+        w.feed(m, 0)
+    assert all(isinstance(x, float) for _, x in w.motion) and w.pose(0.1) == "idle"
+
+
+def test_every_detail_combination_draws_a_full_size_frame():
+    for pose in ("walk", "run"):
+        for i in range(sprites.PHASES[pose]):
+            for stride in (2, 8):
+                for bob in (-2, 2):
+                    check(list(sprites.pick(pose, i, stride=stride, arms=6, bob=bob)), sprites.W, sprites.H)
+    for fidget in (-1, 1): check(list(sprites.pick("idle", 0, bob=-2, fidget=fidget)), sprites.W, sprites.H)

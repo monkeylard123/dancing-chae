@@ -7,6 +7,7 @@ To change his look, edit the coordinates/colours in paint() - no drawing code in
 Frames come out as lists of strings ('.' = transparent), the same format the tests and walker.py use.
 """
 import math
+from functools import lru_cache
 
 PALETTE = {
     "k": "#1a1a1e",   # outline
@@ -178,14 +179,30 @@ def paint(lift=(0, 0), bob=0, swing=0, shut=False, sit=False):
     return g.rows()
 
 
-STAND = paint()
-FRAMES = {
-    "idle":  [STAND] * 6 + [paint(shut=True), STAND],
-    "walk":  [STAND, paint(lift=(3, 0), bob=1, swing=2), STAND, paint(lift=(0, 3), bob=1, swing=-2)],
-    "run":   [paint(lift=(6, 0), bob=2, swing=4), paint(lift=(2, 0), swing=1),
-              paint(lift=(0, 6), bob=2, swing=-4), paint(lift=(0, 2), swing=-1)],
-    "sleep": [paint(sit=True, shut=True), paint(sit=True, shut=True, bob=-1)],   # breathing
-}
+# ---- poses. Each pose has a few animation phases; the live motion detail (from Chae's phone sensor) tweaks them:
+# stride = how high the stepping foot lifts, arms = how far the hands swing, bob = extra body lift (+ up, - down),
+# fidget = a small hand shuffle while standing. The defaults are the look without any sensor data.
+PHASES = {"idle": 8, "walk": 4, "run": 4, "sleep": 2}
+DEFAULT_DETAIL = {"walk": {"stride": 3, "arms": 2}, "run": {"stride": 6, "arms": 4}}
+
+
+@lru_cache(maxsize=2048)
+def pick(pose, i, stride=None, arms=None, bob=0, fidget=0):
+    """The frame (tuple of rows) for animation phase i of pose, with optional live detail."""
+    if pose == "sleep": return tuple(paint(sit=True, shut=True, bob=-(i % 2)))           # breathing
+    if pose == "idle": return tuple(paint(bob=bob, swing=fidget, shut=i == 6))           # phase 6 blinks
+    d = DEFAULT_DETAIL[pose]
+    stride, arms = d["stride"] if stride is None else stride, d["arms"] if arms is None else arms
+    side = 1 if i < 2 else -1                                                            # which foot is stepping
+    if pose == "walk":                                                                   # stand, step, stand, other step
+        up_, b, sw = (stride, 1, arms) if i % 2 else (0, 0, 0)
+    else:                                                                                # run: push off high, then land
+        up_, b, sw = (stride, 2, arms) if i % 2 == 0 else (max(1, stride // 3), 0, arms // 3)
+    return tuple(paint(lift=(up_, 0) if side > 0 else (0, up_), bob=b + bob, swing=sw * side))
+
+
+STAND = list(pick("idle", 0))
+FRAMES = {pose: [list(pick(pose, i)) for i in range(n)] for pose, n in PHASES.items()}
 
 
 def double(rows): return ["".join(ch * 2 for ch in r) for r in rows for _ in (0, 1)]
