@@ -10,7 +10,7 @@ driven live by the step feed from [WalkPad (moovit)](https://github.com/chaepr/m
 | steps are arriving fast (`speed` above WalkPad's `walk_max`, 0.65 by default) | runs |
 | no step for 1.2 s | stands around, blinking now and then |
 | Chae shuffles or sways without a counted step | bobs and fidgets on the spot |
-| Chae pivots or turns around (phone's gyro, from the `/phone` page) | spins round like a paper cut-out, showing his back past 90 degrees, then turns back to face you |
+| Chae turns (phone's gyro, from the `/phone` page) | turns the same way, like a paper cut-out: the way Chae faced when he tapped Start is facing you, side-on is edge-on, and walking the other way shows his back |
 | Chae is disconnected from the server (or he can't reach the server) | sits down for a nap, with z's rising |
 | people are listening (you included) | a little audience gathers to his left and cheers while he moves (10 fans, then `+N`), each labelled with the name they gave; yours is gold |
 
@@ -84,9 +84,10 @@ Messages he uses (schemas in `openapi.json`):
   * moving without a counted step makes him fidget on the spot
   * with no fresh samples (phone page closed) he falls back to his standard animation
 * the `/phone` page's sensor messages also carry `heading` (degrees turned since Start, clockwise seen from above)
-  and `turn_rate`, from the phone's gyroscope. He shows **turns**, not the direction Chae walks in: he turns away from
-  you by however far Chae pivots, then eases back to facing you over about a second and a half. A full 360 is a full
-  spin. Without heading data he always faces you.
+  and `turn_rate`, from the phone's gyroscope. The direction Chae faced when he tapped **Start** (or **Reset
+  session**) is "forward", which is facing you; he then shows Chae's direction relative to that and stays that way,
+  so turning around and walking off shows his back until Chae turns back. The gyro drifts slowly over a long walk:
+  Chae can face his forward direction and tap Reset session to re-centre it. Without heading data he always faces you.
 * anything else is ignored.
 
 ## Changing how he looks
