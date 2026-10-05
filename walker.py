@@ -15,6 +15,7 @@ Ctrl+Alt+P locks/unlocks him; a locked walker is click-through.
 The sprite art lives in walker_sprites.py. Only needs tkinter and aiohttp (see requirements.txt).
 """
 import argparse, asyncio, ctypes, json, logging, logging.handlers, os, queue, sys, threading, time
+from collections import OrderedDict, deque
 
 import walker_sprites as sprites
 
@@ -29,6 +30,10 @@ log = logging.getLogger("walker")
 HOLD = 1.2          # keep walking this long after the last step (s)
 RUN_SPEED = 0.66    # speed above which he runs, unless a state message brings WalkPad's own cfg (walk_max + 0.01)
 FPS = {"idle": 2, "walk": 6, "run": 10, "sleep": 1}
+BATCH = 0.1         # the phone sends a sensor batch about every 0.1 s; its samples are spread over that time
+LAG = 0.12          # play the motion back this far behind real time, so a batch is always there to play
+FRESH = 0.6         # motion data older than this (s) is ignored: the phone page stopped sending
+FIDGET = 0.35       # standing still but moving this much (energy) makes him shuffle on the spot
 LOCK_VK = 0x50      # Ctrl+Alt+P (WalkPad's stats overlay uses L/H/Q, so they can run side by side)
 
 
@@ -72,11 +77,12 @@ class Walker:
     def __init__(self):
         self.online, self.last_step, self.speed, self.run_speed, self.steps = False, None, 0.0, RUN_SPEED, None
         self.listeners, self.chae = 0, None          # chae: is Chae's WalkPad connected to the server (None = not told yet)
+        self.motion = deque()                        # (time, sample / step threshold) from the phone's sensor batches
 
     def set_online(self, on):
         """Whether WE are connected to the listen feed."""
         self.online = on
-        if not on: self.listeners, self.chae = 0, None                 # both unknown until the server tells us again
+        if not on: self.listeners, self.chae = 0, None; self.motion.clear()   # unknown until the server tells us again
 
     def status(self, m):
         """The server's ConnectionMessage {"type": "connection", "data": {"connected": bool}} and ListenerCountMessage
@@ -103,9 +109,54 @@ class Walker:
         if "step" in m: return "step", m
         return None, None
 
+    def sensor(self, m, now):
+        """Phone motion: {"type": "sensor", "data": {"samples": [...], "threshold": t}} (or WalkPad's own {"t": "sig",
+        "v": [...], "thr": t}). Samples are the phone's acceleration signal; dividing by the step threshold makes a
+        typical step peak about 1. Returns True if m was one."""
+        if not isinstance(m, dict): return False
+        if m.get("type") == "sensor" and isinstance(m.get("data"), dict): v, thr = m["data"].get("samples"), m["data"].get("threshold")
+        elif m.get("t") == "sig": v, thr = m.get("v"), m.get("thr")
+        else: return False
+        v = [x for x in v if isinstance(x, (int, float)) and not isinstance(x, bool)] if isinstance(v, list) else []
+        thr = thr if isinstance(thr, (int, float)) and thr > 0.05 else 1.0
+        start = max(now, self.motion[-1][0] + BATCH / max(1, len(v))) if self.motion else now   # keep playback in order
+        if start > now + 2 * BATCH:                                   # batches bunched up: don't drift behind
+            while self.motion and self.motion[-1][0] >= now: self.motion.pop()
+            start = now
+        for k, x in enumerate(v): self.motion.append((start + k * BATCH / len(v), x / thr))
+        while self.motion and self.motion[0][0] < now - 2: self.motion.popleft()
+        return True
+
+    def signal(self, now):
+        """The motion sample playing right now (about 1 at a step peak), or 0 without fresh data."""
+        at, val = now - LAG, 0.0
+        for ts, x in self.motion:
+            if ts > at: break
+            val = x if at - ts < FRESH else 0.0
+        return val
+
+    def energy(self, now):
+        """How hard he's moving over the last second (RMS of the samples, ~1 for firm steps), or None without data."""
+        xs = [x for ts, x in self.motion if now - LAG - 1 <= ts <= now - LAG]
+        return (sum(x * x for x in xs) / len(xs)) ** 0.5 if len(xs) >= 6 else None
+
+    def look(self, now=None):
+        """Everything needed to draw him: (pose, phase, detail) where detail feeds sprites.pick()."""
+        now = time.time() if now is None else now
+        pose, i = self.frame(now)
+        e, sig = self.energy(now), self.signal(now)
+        if pose == "sleep" or e is None: return pose, i, ()
+        bob = max(-2, min(2, round(sig * 2)))                         # his body follows the phone's bounce
+        if pose == "idle":
+            fidget = (1 if int(now * 4) % 2 else -1) if e > FIDGET else 0
+            return pose, i, (("bob", bob), ("fidget", fidget))
+        e = min(e, 1.5) / 1.5                                         # 0 = barely moving .. 1 = stomping
+        base = 2 if pose == "walk" else 4
+        return pose, i, (("stride", base + round(4 * e)), ("arms", base // 2 + round(4 * e)), ("bob", bob))
+
     def feed(self, m, now=None):
         now = time.time() if now is None else now
-        if self.status(m): return
+        if self.status(m) or self.sensor(m, now): return
         kind, d = self.kind(m)
         if kind is None: return
         speed = d.get("speed")
@@ -129,10 +180,10 @@ class Walker:
         return "run" if self.speed > self.run_speed else "walk"
 
     def frame(self, now=None):
-        """(pose, index into sprites.FRAMES[pose])."""
+        """(pose, animation phase)."""
         now = time.time() if now is None else now
         p = self.pose(now)
-        return p, int(now * FPS[p]) % len(sprites.FRAMES[p])
+        return p, int(now * FPS[p]) % sprites.PHASES[p]
 
 
 # ---------------------------------------------------------------- data sources
@@ -214,8 +265,18 @@ class Feed(threading.Thread):
 
 
 class Demo(threading.Thread):
-    """Fake data: idle, walk, run, idle, then Chae disconnects (nap), repeating."""
+    """Fake data: idle, walk, run, idle, then Chae disconnects (nap), repeating. Sends phone motion too."""
     def __init__(self, q): super().__init__(daemon=True); self.q = q
+
+    def motion(self, gap, strength, secs):
+        """Sensor batches every 0.1 s for secs: a bump per step (or a little sway while standing)."""
+        import math
+        for b in range(max(1, round(secs / BATCH))):
+            t0 = time.time()
+            if gap: v = [strength * 0.9 * math.sin(math.pi * 2 * (t0 + k * BATCH / 6) / gap) for k in range(6)]
+            else: v = [0.12 * math.sin(t0 * 3 + k * 0.1) for k in range(6)]
+            self.q.put(("msg", {"type": "sensor", "data": {"samples": [round(x, 2) for x in v], "rejected": 0, "threshold": 1.0}}))
+            time.sleep(BATCH)
 
     def run(self):
         steps, fans = 0, 0
@@ -230,8 +291,7 @@ class Demo(threading.Thread):
                         steps += 1
                         self.q.put(("msg", {"type": "step", "data": {"step": steps, "gap": gap, "speed": speed, "out": speed,
                                                                      "source": "phone"}}))
-                        time.sleep(gap)
-                    else: time.sleep(0.5)
+                    self.motion(gap, 1.4 if gap and gap < 0.4 else 1.0, gap or 0.5)
             self.q.put(("msg", {"type": "connection", "data": {"connected": False}})); time.sleep(6)
 
 
@@ -240,7 +300,7 @@ class App:
     def __init__(self, conf, source, win=None):
         import tkinter as tk
         self.tk, self.c, self.walker, self.q = tk, conf, Walker(), queue.Queue()
-        self.win, self.drag, self.cache, self.shown, self.lock_down = win or Win32(), None, {}, None, False
+        self.win, self.drag, self.cache, self.shown, self.lock_down = win or Win32(), None, OrderedDict(), None, False
         self.placed_crowd = (0, 0)
         if IS_WINDOWS:
             try: ctypes.windll.shcore.SetProcessDpiAwareness(2)
@@ -349,7 +409,9 @@ class App:
     def image(self, rows):
         """A Tk image of one frame at the current scale (pixels not put stay transparent)."""
         key = (tuple(rows), self.c["scale"])
-        if key not in self.cache:
+        if key in self.cache: self.cache.move_to_end(key)
+        else:
+            if len(self.cache) > 300: self.cache.popitem(last=False)  # live motion makes many variants; keep the recent ones
             img = self.tk.PhotoImage(width=len(rows[0]), height=len(rows))
             for y, row in enumerate(rows):                            # one put per run of same-coloured pixels
                 x = 0
@@ -362,15 +424,15 @@ class App:
         return self.cache[key]
 
     def draw(self):
-        pose, i = self.walker.frame()
+        pose, i, detail = self.walker.look()
         z = int(time.time() * 1.5) % 3 if pose == "sleep" else -1
         cheer = int(time.time() * 4) if pose in ("walk", "run") else -1   # the crowd cheers while he moves
-        key = (pose, i, z, cheer, self.crowd())
+        key = (pose, i, detail, z, cheer, self.crowd())
         if key == self.shown: return
         self.shown = key; s = self.c["scale"]; w, h = self.size(); (shown, extra) = self.crowd()
         self.cv.delete("all")
         top, bottom, me = sprites.HEADROOM, sprites.H + sprites.HEADROOM, self.crowd_w()
-        self.cv.create_image(me * s, top * s, image=self.image(sprites.FRAMES[pose][i]), anchor="nw")
+        self.cv.create_image(me * s, top * s, image=self.image(sprites.pick(pose, i, **dict(detail))), anchor="nw")
         lx = 0                                                        # audience to his left: "+N" furthest out, then the fans
         for ch in self.label(extra):
             self.cv.create_image(lx * s, (bottom - sprites.DIGIT_H - 2) * s, image=self.image(sprites.DIGITS[ch]), anchor="nw")
