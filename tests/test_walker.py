@@ -1,4 +1,4 @@
-"""Tests for walker.py: sprite data, what pose he's in, and the audience count."""
+"""Tests for walker.py: sprite data, what pose he's in, Chae's connection, the audience, and finding the feed."""
 import os, sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -68,18 +68,45 @@ def test_animation_frames_cycle():
     assert seen == set(range(len(sprites.FRAMES["walk"])))
 
 
-# ---------- audience ----------
-def test_listener_count_in_any_of_the_accepted_shapes():
+# ---------- Chae's connection and the audience (ConnectionMessage / ListenerCountMessage) ----------
+CONNECTED = {"type": "connection", "data": {"connected": True}}
+GONE = {"type": "connection", "data": {"connected": False}}
+
+
+def test_naps_while_chae_is_disconnected_from_the_server():
+    w = walker.Walker(); w.set_online(True); w.feed(CONNECTED)
+    w.feed(STEP, 0); assert w.pose(0.1) == "walk"
+    w.feed(GONE, 0.2); assert w.pose(0.3) == "sleep"                      # even mid-walk
+    w.feed(CONNECTED, 1); assert w.pose(1.0 + walker.HOLD) == "idle"      # wakes up when Chae is back
+
+
+def test_chae_status_is_forgotten_when_we_lose_the_feed():
+    w = walker.Walker(); w.set_online(True); w.feed(GONE)
+    w.set_online(False); assert w.chae is None and w.pose(0) == "sleep"
+    w.set_online(True); assert w.pose(0) == "idle"                        # older servers never send a connection message
+
+
+def test_bad_connection_messages_change_nothing():
     w = walker.Walker(); w.set_online(True)
-    w.feed({"listeners": 3}); assert w.listeners == 3
-    w.feed({"type": "listeners", "count": 7}); assert w.listeners == 7
-    w.feed({"type": "audience", "data": {"count": 2}}); assert w.listeners == 2
-    w.feed(dict(STEP, listeners=12), 0); assert w.listeners == 12 and w.pose(0.1) == "walk"   # riding along on a step
-    w.feed({"listeners": -1}); w.feed({"listeners": True}); assert w.listeners == 12
+    for m in ({"type": "connection", "data": {"connected": "no"}}, {"type": "connection", "data": {}},
+              {"type": "connection"}, {"type": "connection", "data": [False]}):
+        w.feed(m)
+    assert w.chae is None and w.pose(0) == "idle"
 
 
-def test_audience_leaves_when_disconnected():
-    w = walker.Walker(); w.set_online(True); w.feed({"listeners": 4})
+def test_audience_is_everyone_listening_except_him():
+    w = walker.Walker(); w.set_online(True)
+    w.feed({"type": "listeners", "data": {"count": 1}}); assert w.listeners == 0     # just him
+    w.feed({"type": "listeners", "data": {"count": 8}}); assert w.listeners == 7
+    for bad in ({"type": "listeners", "data": {"count": -1}}, {"type": "listeners", "data": {"count": True}},
+                {"type": "listeners", "count": 3}, {"listeners": 3}):
+        w.feed(bad)
+    assert w.listeners == 7
+    w.feed({"type": "listeners", "data": {"count": 0}}); assert w.listeners == 0
+
+
+def test_audience_leaves_when_we_lose_the_feed():
+    w = walker.Walker(); w.set_online(True); w.feed({"type": "listeners", "data": {"count": 5}})
     w.set_online(False); assert w.listeners == 0
 
 
@@ -91,9 +118,9 @@ def test_listen_url_comes_from_the_openapi_document():
     assert walker.listen_url(spec, "http://localhost:3000") == "ws://localhost:3000/feeds/listen"
 
 
-def test_listen_url_falls_back_when_the_document_is_missing_or_odd():
+def test_no_listen_socket_without_the_openapi_document():
     for spec in (None, {}, {"paths": None}, [1], {"paths": {"/ws": {"get": {"x-websocket-messages": "?"}}}}):
-        assert walker.listen_url(spec, "https://x.example") == "wss://x.example/ws/listen"
+        assert walker.listen_url(spec, "https://x.example") is None
 
 
 def test_new_step_envelope_from_openapi_is_understood():

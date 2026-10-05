@@ -9,8 +9,8 @@ driven live by the step feed from [WalkPad (moovit)](https://github.com/chaepr/m
 | steps are arriving | walks |
 | steps are arriving fast (`speed` above WalkPad's `walk_max`, 0.65 by default) | runs |
 | no step for 1.2 s | stands around, blinking now and then |
-| the WebSocket is disconnected | sits down for a nap, with z's rising |
-| listeners are connected | a little audience gathers to his left and cheers while he moves (10 fans, then `+N`) |
+| Chae is disconnected from the server (or he can't reach the server) | sits down for a nap, with z's rising |
+| other people are listening | a little audience gathers to his left and cheers while he moves (10 fans, then `+N`) |
 
 ## Run it (Windows)
 
@@ -32,8 +32,7 @@ pip install -r requirements.txt
 python walker.py                              # live feed
 python walker.py --demo                       # fake data: idle, walk, run, nap, with a growing audience
 python walker.py --scale 3                    # bigger (1 to 6, default 2)
-python walker.py --server https://other.host  # another Chae WebSocket server
-python walker.py --url ws://127.0.0.1:8080/ws # skip discovery and listen to a socket directly
+python walker.py --server https://other.host  # another Chae WebSocket server (found through its openapi.json)
 python walker.py --reset                      # forget the saved position and size
 ```
 
@@ -41,16 +40,20 @@ Transparency and click-through use Windows APIs. On macOS/Linux he runs, but wit
 
 ## Where the data comes from
 
-On every (re)connect he reads `https://runchaerun.cactus.vg/openapi.json` and listens on the path that declares
-server-to-client `x-websocket-messages` (today `/ws/listen`). If the document can't be read, he uses `/ws/listen`.
+He only ever finds the feed through the server's OpenAPI document. Before every (re)connect he reads
+`https://runchaerun.cactus.vg/openapi.json` again and listens on the path that declares server-to-client
+`x-websocket-messages` (today `/ws/listen`). If the document can't be read or names no such path, he keeps napping
+and asks again a couple of seconds later.
 
-Accepted messages:
+Messages he uses (schemas in `openapi.json`):
 
-* `{"type": "step", "data": {"step", "speed", "gap", ...}}` and `{"type": "state", "data": {...}}`: the `StepMessage` /
-  `StateMessage` envelopes from `openapi.json`. A state message's `cfg.walk_max` replaces the default run threshold.
-* bare step objects (`{"step", "speed", "gap", ...}`), which older server versions relayed, and WalkPad's bare state.
-* **audience (not sent by the server yet):** `{"type": "listeners", "count": n}` (also `"audience"`, or `count` inside
-  `data`), or a `"listeners": n` field on any message.
+* `{"type": "connection", "data": {"connected": true|false}}`: whether Chae's WalkPad is connected to the server.
+  While it's `false` he naps. The server sends it as soon as he connects and again whenever Chae connects or disconnects.
+* `{"type": "listeners", "data": {"count": n}}`: how many people are listening, him included. The audience is
+  everyone except him (`n - 1`).
+* `{"type": "step", "data": {"step", "speed", "gap", ...}}` and `{"type": "state", "data": {...}}`: Chae's steps and
+  WalkPad's state. A state message's `cfg.walk_max` replaces the default run threshold. Bare step objects (what older
+  server versions relayed) and WalkPad's bare state also work.
 * `sensor` messages and anything else are ignored.
 
 ## Changing how he looks
@@ -66,7 +69,7 @@ pip install -r requirements-dev.txt
 pytest -q
 ```
 
-They cover the frame sizes and colours, the pose rules, the message shapes, the audience count, OpenAPI discovery
+They cover the frame sizes and colours, the pose rules, Chae's connection status, the audience count, OpenAPI discovery
 and the click-through calls (through a fake `user32`). Not covered: real transparency and hotkeys on screen.
 
 ## Files

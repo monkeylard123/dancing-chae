@@ -3,12 +3,11 @@
 Dancing Chae - a little pixel-art guy who lives on your desktop and walks when Chae walks (Windows).
 
     py walker.py                          # finds the listen socket in https://runchaerun.cactus.vg/openapi.json
-    py walker.py --server https://...     # another Chae WebSocket server (also read through its openapi.json)
-    py walker.py --url ws://...           # skip discovery: listen to this WebSocket directly
-    py walker.py --demo           # fake data: idle, walk, run, then a nap when the "connection" drops
+    py walker.py --server https://...     # another Chae WebSocket server (also found through its openapi.json)
+    py walker.py --demo                   # fake data: idle, walk, run, then a nap when Chae "disconnects"
 
 He walks while steps are coming in, runs when the pace is fast, stands around when you stop,
-and lies down for a nap whenever the WebSocket is disconnected.
+and naps whenever Chae is disconnected from the server (or he can't reach the server himself).
 
 First run he starts UNLOCKED: drag him where you want, scroll to resize, right-click for a menu.
 Ctrl+Alt+P locks/unlocks him; a locked walker is click-through.
@@ -70,24 +69,24 @@ class Walker:
     """Turns feed messages and connection changes into a pose ("sleep", "idle", "walk", "run") and an animation frame."""
     def __init__(self):
         self.online, self.last_step, self.speed, self.run_speed, self.steps = False, None, 0.0, RUN_SPEED, None
-        self.listeners = 0
+        self.listeners, self.chae = 0, None          # chae: is Chae's WalkPad connected to the server (None = not told yet)
 
     def set_online(self, on):
+        """Whether WE are connected to the listen feed."""
         self.online = on
-        if not on: self.listeners = 0                                  # the count is unknown while disconnected
+        if not on: self.listeners, self.chae = 0, None                 # both unknown until the server tells us again
 
-    def audience(self, m):
-        """Picks up a listener count. The server doesn't send one yet; accepted shapes are {"listeners": n} (alone or on any
-        message), {"type": "listeners"|"audience", "count": n} and the same inside "data". Returns True if m was only that."""
-        if not isinstance(m, dict): return False
-        d = m.get("data") if isinstance(m.get("data"), dict) else {}
-        for src in (m, d):
-            for key in ("listeners", "listener_count", "audience"):
-                v = src.get(key)
-                if isinstance(v, int) and not isinstance(v, bool) and v >= 0: self.listeners = v
-        if m.get("type") in ("listeners", "audience"):
-            v = m.get("count", d.get("count"))
-            if isinstance(v, int) and not isinstance(v, bool) and v >= 0: self.listeners = v
+    def status(self, m):
+        """The server's ConnectionMessage {"type": "connection", "data": {"connected": bool}} and ListenerCountMessage
+        {"type": "listeners", "data": {"count": n}} (see openapi.json). Returns True if m was one of them."""
+        if not isinstance(m, dict) or not isinstance(m.get("data"), dict): return False
+        d = m["data"]
+        if m.get("type") == "connection":
+            if isinstance(d.get("connected"), bool): self.chae = d["connected"]
+            return True
+        if m.get("type") == "listeners":
+            n = d.get("count")
+            if isinstance(n, int) and not isinstance(n, bool) and n >= 0: self.listeners = max(0, n - 1)   # minus himself
             return True
         return False
 
@@ -104,7 +103,7 @@ class Walker:
 
     def feed(self, m, now=None):
         now = time.time() if now is None else now
-        if self.audience(m): return
+        if self.status(m): return
         kind, d = self.kind(m)
         if kind is None: return
         speed = d.get("speed")
@@ -123,7 +122,7 @@ class Walker:
 
     def pose(self, now=None):
         now = time.time() if now is None else now
-        if not self.online: return "sleep"
+        if not self.online or self.chae is False: return "sleep"
         if self.last_step is None or now - self.last_step >= HOLD: return "idle"
         return "run" if self.speed > self.run_speed else "walk"
 
@@ -137,13 +136,14 @@ class Walker:
 # ---------------------------------------------------------------- data sources
 def listen_url(spec, server):
     """The WebSocket URL to listen on, from the server's OpenAPI document: the path that declares server-to-client
-    x-websocket-messages (preferring one with "listen" in it). Falls back to /ws/listen."""
+    x-websocket-messages (preferring one with "listen" in it). None if the document doesn't name one."""
     found = []
     paths = (spec or {}).get("paths") if isinstance(spec, dict) else None
     for path, ops in (paths or {}).items():
         msgs = ((ops or {}).get("get") or {}).get("x-websocket-messages") or []
         if any(isinstance(m, dict) and m.get("direction") == "server-to-client" for m in msgs): found.append(path)
-    path = sorted(found, key=lambda p: ("listen" not in p, p))[0] if found else "/ws/listen"
+    if not found: return None
+    path = sorted(found, key=lambda p: ("listen" not in p, p))[0]
     base = server.rstrip("/")
     if base.startswith("https://"): base = "wss://" + base[8:]
     elif base.startswith("http://"): base = "ws://" + base[7:]
@@ -153,19 +153,17 @@ def listen_url(spec, server):
 class Feed(threading.Thread):
     """Listens to the WebSocket and reconnects forever. Only reports "online" once the connection proves itself
     (a message arrives or it stays open 2 s), so a server that accepts and instantly drops us doesn't wake him up.
-    Without a fixed url it asks the server's /openapi.json where to listen, on every (re)connect."""
-    def __init__(self, q, server=None, url=None): super().__init__(daemon=True); self.q, self.server, self.url = q, server, url
+    Where to listen always comes from the server's /openapi.json, queried again before every (re)connect;
+    if it can't be read or names no listen socket, he stays asleep and asks again."""
+    def __init__(self, q, server): super().__init__(daemon=True); self.q, self.server = q, server
 
     def run(self): asyncio.run(self.main())
 
     async def resolve(self, s):
-        if self.url: return self.url
-        spec = None
         try:
             async with s.get(self.server.rstrip("/") + "/openapi.json", timeout=10) as r:
-                if r.status == 200: spec = await r.json(content_type=None)
-        except Exception: pass
-        return listen_url(spec, self.server)
+                return listen_url(await r.json(content_type=None), self.server) if r.status == 200 else None
+        except Exception: return None
 
     async def main(self):
         import aiohttp
@@ -173,7 +171,9 @@ class Feed(threading.Thread):
             told = False
             try:
                 async with aiohttp.ClientSession() as s:
-                    async with s.ws_connect(await self.resolve(s), heartbeat=15) as ws:
+                    url = await self.resolve(s)
+                    if url is None: raise ConnectionError("openapi.json has no listen socket")
+                    async with s.ws_connect(url, heartbeat=15) as ws:
                         opened = time.time()
                         while True:
                             try: m = await ws.receive(timeout=0.5)
@@ -191,16 +191,16 @@ class Feed(threading.Thread):
 
 
 class Demo(threading.Thread):
-    """Fake data: idle, walk, run, idle, then disconnected (nap), repeating."""
+    """Fake data: idle, walk, run, idle, then Chae disconnects (nap), repeating."""
     def __init__(self, q): super().__init__(daemon=True); self.q = q
 
     def run(self):
         steps, fans = 0, 0
         while True:
-            self.q.put(("online", True))
+            self.q.put(("online", True)); self.q.put(("msg", {"type": "connection", "data": {"connected": True}}))
             for gap, speed, secs in ((None, 0, 3), (0.55, 0.5, 6), (0.3, 0.95, 5), (None, 0, 3)):
                 fans = fans + 3 if fans < 14 else 1                   # listeners hop in, up past the "+N" limit
-                self.q.put(("msg", {"type": "listeners", "count": fans}))
+                self.q.put(("msg", {"type": "listeners", "data": {"count": fans + 1}}))       # the count includes him
                 end = time.time() + secs
                 while time.time() < end:
                     if gap:                                           # same shape as the listen feed (openapi StepMessage)
@@ -209,7 +209,7 @@ class Demo(threading.Thread):
                                                                      "source": "phone"}}))
                         time.sleep(gap)
                     else: time.sleep(0.5)
-            self.q.put(("online", False)); time.sleep(6)
+            self.q.put(("msg", {"type": "connection", "data": {"connected": False}})); time.sleep(6)
 
 
 # ---------------------------------------------------------------- the window
@@ -340,7 +340,6 @@ class App:
 def main(argv=None):
     ap = argparse.ArgumentParser(description="Dancing Chae desktop walker")
     ap.add_argument("--server", help=f"Chae WebSocket server to read openapi.json from (default {DEFAULTS['server']})")
-    ap.add_argument("--url", help="listen to this WebSocket directly instead of discovering it")
     ap.add_argument("--demo", action="store_true", help="use fake data")
     ap.add_argument("--scale", type=int, help=f"pixel size, {MIN_SCALE} to {MAX_SCALE} (default {DEFAULTS['scale']})")
     ap.add_argument("--unlock", action="store_true", help="start unlocked so you can move him")
@@ -351,7 +350,7 @@ def main(argv=None):
     if a.scale: conf["scale"] = a.scale
     conf["scale"] = max(MIN_SCALE, min(MAX_SCALE, int(conf["scale"])))
     if a.unlock or a.reset or not os.path.exists(CONF): conf["locked"] = False
-    app = App(conf, (lambda q: Demo(q)) if a.demo else (lambda q: Feed(q, conf["server"], a.url)))
+    app = App(conf, (lambda q: Demo(q)) if a.demo else (lambda q: Feed(q, conf["server"])))
     print("Dancing Chae running.  Right-click for the menu, Ctrl+Alt+P lock/unlock", flush=True)
     app.root.mainloop(); save_conf(conf)
 
