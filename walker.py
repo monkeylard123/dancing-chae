@@ -182,10 +182,15 @@ class Feed(threading.Thread):
 
     async def main(self):
         import aiohttp
+        import asyncio
+        import certifi
+        import ssl
+        ssl_context = ssl.create_default_context(cafile=certifi.where())
+        connector = aiohttp.TCPConnector(ssl=ssl_context)
         while True:
             told, server = False, self.server
             try:
-                async with aiohttp.ClientSession() as s:
+                async with aiohttp.ClientSession(connector=connector) as s:
                     self.say(f"Reading {server.rstrip('/')}/openapi.json")
                     url = await self.resolve(s, server)
                     self.say(f"Connecting to {url}")
