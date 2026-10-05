@@ -10,7 +10,7 @@ driven live by the step feed from [WalkPad (moovit)](https://github.com/chaepr/m
 | steps are arriving fast (`speed` above WalkPad's `walk_max`, 0.65 by default) | runs |
 | no step for 1.2 s | stands around, blinking now and then |
 | Chae is disconnected from the server (or he can't reach the server) | sits down for a nap, with z's rising |
-| other people are listening | a little audience gathers to his left and cheers while he moves (10 fans, then `+N`) |
+| people are listening (you included) | a little audience gathers to his left and cheers while he moves (10 fans, then `+N`) |
 
 ## Run it (Windows)
 
@@ -49,8 +49,8 @@ Messages he uses (schemas in `openapi.json`):
 
 * `{"type": "connection", "data": {"connected": true|false}}`: whether Chae's WalkPad is connected to the server.
   While it's `false` he naps. The server sends it as soon as he connects and again whenever Chae connects or disconnects.
-* `{"type": "listeners", "data": {"count": n}}`: how many people are listening, him included. The audience is
-  everyone except him (`n - 1`).
+* `{"type": "listeners", "data": {"count": n}}`: how many walkers/listeners are connected, yours included. Each one
+  is a fan in the audience, so you always see yourself.
 * `{"type": "step", "data": {"step", "speed", "gap", ...}}` and `{"type": "state", "data": {...}}`: Chae's steps and
   WalkPad's state. A state message's `cfg.walk_max` replaces the default run threshold. Bare step objects (what older
   server versions relayed) and WalkPad's bare state also work.

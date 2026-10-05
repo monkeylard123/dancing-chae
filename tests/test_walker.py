@@ -94,14 +94,14 @@ def test_bad_connection_messages_change_nothing():
     assert w.chae is None and w.pose(0) == "idle"
 
 
-def test_audience_is_everyone_listening_except_him():
+def test_audience_is_everyone_listening_including_you():
     w = walker.Walker(); w.set_online(True)
-    w.feed({"type": "listeners", "data": {"count": 1}}); assert w.listeners == 0     # just him
-    w.feed({"type": "listeners", "data": {"count": 8}}); assert w.listeners == 7
+    w.feed({"type": "listeners", "data": {"count": 1}}); assert w.listeners == 1     # just you
+    w.feed({"type": "listeners", "data": {"count": 8}}); assert w.listeners == 8
     for bad in ({"type": "listeners", "data": {"count": -1}}, {"type": "listeners", "data": {"count": True}},
                 {"type": "listeners", "count": 3}, {"listeners": 3}):
         w.feed(bad)
-    assert w.listeners == 7
+    assert w.listeners == 8
     w.feed({"type": "listeners", "data": {"count": 0}}); assert w.listeners == 0
 
 

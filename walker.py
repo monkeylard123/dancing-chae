@@ -86,7 +86,7 @@ class Walker:
             return True
         if m.get("type") == "listeners":
             n = d.get("count")
-            if isinstance(n, int) and not isinstance(n, bool) and n >= 0: self.listeners = max(0, n - 1)   # minus himself
+            if isinstance(n, int) and not isinstance(n, bool) and n >= 0: self.listeners = n   # includes you, watching him
             return True
         return False
 
@@ -200,7 +200,7 @@ class Demo(threading.Thread):
             self.q.put(("online", True)); self.q.put(("msg", {"type": "connection", "data": {"connected": True}}))
             for gap, speed, secs in ((None, 0, 3), (0.55, 0.5, 6), (0.3, 0.95, 5), (None, 0, 3)):
                 fans = fans + 3 if fans < 14 else 1                   # listeners hop in, up past the "+N" limit
-                self.q.put(("msg", {"type": "listeners", "data": {"count": fans + 1}}))       # the count includes him
+                self.q.put(("msg", {"type": "listeners", "data": {"count": fans}}))
                 end = time.time() + secs
                 while time.time() < end:
                     if gap:                                           # same shape as the listen feed (openapi StepMessage)
