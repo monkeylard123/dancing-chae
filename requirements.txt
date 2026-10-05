@@ -1,0 +1,2 @@
+# tkinter comes with the python.org installer.
+aiohttp>=3.9

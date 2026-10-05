@@ -1,0 +1,360 @@
+#!/usr/bin/env python3
+"""
+Dancing Chae - a little pixel-art guy who lives on your desktop and walks when Chae walks (Windows).
+
+    py walker.py                          # finds the listen socket in https://runchaerun.cactus.vg/openapi.json
+    py walker.py --server https://...     # another Chae WebSocket server (also read through its openapi.json)
+    py walker.py --url ws://...           # skip discovery: listen to this WebSocket directly
+    py walker.py --demo           # fake data: idle, walk, run, then a nap when the "connection" drops
+
+He walks while steps are coming in, runs when the pace is fast, stands around when you stop,
+and lies down for a nap whenever the WebSocket is disconnected.
+
+First run he starts UNLOCKED: drag him where you want, scroll to resize, right-click for a menu.
+Ctrl+Alt+P locks/unlocks him; a locked walker is click-through.
+
+The sprite art lives in walker_sprites.py. Only needs tkinter and aiohttp (see requirements.txt).
+"""
+import argparse, asyncio, ctypes, json, os, queue, sys, threading, time
+
+import walker_sprites as sprites
+
+IS_WINDOWS = sys.platform == "win32"
+KEY = "#010203"                     # this exact colour becomes fully transparent (Windows)
+
+DEFAULTS = {"x": None, "y": None, "scale": 2, "locked": False, "server": "https://runchaerun.cactus.vg"}
+MIN_SCALE, MAX_SCALE = 1, 6
+CONF = os.path.join(os.environ.get("WALKER_DATA_DIR") or os.path.dirname(os.path.abspath(__file__)), "walker.json")
+HOLD = 1.2          # keep walking this long after the last step (s)
+RUN_SPEED = 0.66    # speed above which he runs, unless a state message brings WalkPad's own cfg (walk_max + 0.01)
+FPS = {"idle": 2, "walk": 6, "run": 10, "sleep": 1}
+LOCK_VK = 0x50      # Ctrl+Alt+P (WalkPad's stats overlay uses L/H/Q, so they can run side by side)
+
+
+def load_conf(path=CONF):
+    c = dict(DEFAULTS)
+    try:
+        with open(path) as f: c.update({k: v for k, v in json.load(f).items() if k in DEFAULTS})
+    except (OSError, ValueError): pass
+    return c
+
+
+def save_conf(c, path=CONF):
+    try:
+        with open(path, "w") as f: json.dump(c, f, indent=2)
+    except OSError: pass
+
+
+# ---------------------------------------------------------------- Windows bits (isolated so they can be faked in tests)
+class Win32:
+    GWL_EXSTYLE, LAYERED, TRANSPARENT, TOOLWINDOW, NOACTIVATE = -20, 0x80000, 0x20, 0x80, 0x08000000
+
+    def __init__(self, user32=None):
+        self.user32 = user32 or (ctypes.windll.user32 if IS_WINDOWS else None)
+
+    def click_through(self, wid, on):
+        """on: mouse clicks pass straight through him. off: he can be dragged again."""
+        u = self.user32
+        if u is None: return
+        hwnd = u.GetAncestor(wid, 2) or wid                  # Tk gives a child window; we need the top-level one
+        st = u.GetWindowLongW(hwnd, self.GWL_EXSTYLE) | self.LAYERED | self.TOOLWINDOW
+        st = (st | self.TRANSPARENT | self.NOACTIVATE) if on else (st & ~(self.TRANSPARENT | self.NOACTIVATE))
+        u.SetWindowLongW(hwnd, self.GWL_EXSTYLE, st)
+
+    def key_down(self, vk):
+        return bool(self.user32 and self.user32.GetAsyncKeyState(vk) & 0x8000)
+
+
+# ---------------------------------------------------------------- what he's doing (no GUI code: easy to test)
+class Walker:
+    """Turns feed messages and connection changes into a pose ("sleep", "idle", "walk", "run") and an animation frame."""
+    def __init__(self):
+        self.online, self.last_step, self.speed, self.run_speed, self.steps = False, None, 0.0, RUN_SPEED, None
+        self.listeners = 0
+
+    def set_online(self, on):
+        self.online = on
+        if not on: self.listeners = 0                                  # the count is unknown while disconnected
+
+    def audience(self, m):
+        """Picks up a listener count. The server doesn't send one yet; accepted shapes are {"listeners": n} (alone or on any
+        message), {"type": "listeners"|"audience", "count": n} and the same inside "data". Returns True if m was only that."""
+        if not isinstance(m, dict): return False
+        d = m.get("data") if isinstance(m.get("data"), dict) else {}
+        for src in (m, d):
+            for key in ("listeners", "listener_count", "audience"):
+                v = src.get(key)
+                if isinstance(v, int) and not isinstance(v, bool) and v >= 0: self.listeners = v
+        if m.get("type") in ("listeners", "audience"):
+            v = m.get("count", d.get("count"))
+            if isinstance(v, int) and not isinstance(v, bool) and v >= 0: self.listeners = v
+            return True
+        return False
+
+    @staticmethod
+    def kind(m):
+        """("step"|"state"|None, payload). The listen feed sends bare step objects ({"step", "speed", "gap", ...});
+        WalkPad's outbound socket wraps them as {"type": "step"|"state", "data": {...}}; its own /ws sends bare state."""
+        if not isinstance(m, dict): return None, None
+        if isinstance(m.get("data"), dict) and m.get("type") in ("step", "state"): return m["type"], m["data"]
+        if "type" in m or "t" in m: return None, None                 # login replies, sensor batches, pongs, ...
+        if "steps" in m: return "state", m
+        if "step" in m: return "step", m
+        return None, None
+
+    def feed(self, m, now=None):
+        now = time.time() if now is None else now
+        if self.audience(m): return
+        kind, d = self.kind(m)
+        if kind is None: return
+        speed = d.get("speed")
+        if isinstance(speed, (int, float)): self.speed = speed
+        if kind == "step":
+            self.last_step = now
+        else:
+            steps = d.get("steps")
+            if isinstance(steps, int):
+                if self.steps is not None and steps > self.steps: self.last_step = now
+                self.steps = steps
+            if isinstance(speed, (int, float)) and speed > 0: self.last_step = now     # WalkPad's speed fades out after the last step
+            cfg = d.get("cfg") or {}
+            if isinstance(cfg.get("walk_max"), (int, float)) and d.get("output", "gamepad") == "gamepad":
+                self.run_speed = cfg["walk_max"] + 0.01
+
+    def pose(self, now=None):
+        now = time.time() if now is None else now
+        if not self.online: return "sleep"
+        if self.last_step is None or now - self.last_step >= HOLD: return "idle"
+        return "run" if self.speed > self.run_speed else "walk"
+
+    def frame(self, now=None):
+        """(pose, index into sprites.FRAMES[pose])."""
+        now = time.time() if now is None else now
+        p = self.pose(now)
+        return p, int(now * FPS[p]) % len(sprites.FRAMES[p])
+
+
+# ---------------------------------------------------------------- data sources
+def listen_url(spec, server):
+    """The WebSocket URL to listen on, from the server's OpenAPI document: the path that declares server-to-client
+    x-websocket-messages (preferring one with "listen" in it). Falls back to /ws/listen."""
+    found = []
+    paths = (spec or {}).get("paths") if isinstance(spec, dict) else None
+    for path, ops in (paths or {}).items():
+        msgs = ((ops or {}).get("get") or {}).get("x-websocket-messages") or []
+        if any(isinstance(m, dict) and m.get("direction") == "server-to-client" for m in msgs): found.append(path)
+    path = sorted(found, key=lambda p: ("listen" not in p, p))[0] if found else "/ws/listen"
+    base = server.rstrip("/")
+    if base.startswith("https://"): base = "wss://" + base[8:]
+    elif base.startswith("http://"): base = "ws://" + base[7:]
+    return base + path
+
+
+class Feed(threading.Thread):
+    """Listens to the WebSocket and reconnects forever. Only reports "online" once the connection proves itself
+    (a message arrives or it stays open 2 s), so a server that accepts and instantly drops us doesn't wake him up.
+    Without a fixed url it asks the server's /openapi.json where to listen, on every (re)connect."""
+    def __init__(self, q, server=None, url=None): super().__init__(daemon=True); self.q, self.server, self.url = q, server, url
+
+    def run(self): asyncio.run(self.main())
+
+    async def resolve(self, s):
+        if self.url: return self.url
+        spec = None
+        try:
+            async with s.get(self.server.rstrip("/") + "/openapi.json", timeout=10) as r:
+                if r.status == 200: spec = await r.json(content_type=None)
+        except Exception: pass
+        return listen_url(spec, self.server)
+
+    async def main(self):
+        import aiohttp
+        while True:
+            told = False
+            try:
+                async with aiohttp.ClientSession() as s:
+                    async with s.ws_connect(await self.resolve(s), heartbeat=15) as ws:
+                        opened = time.time()
+                        while True:
+                            try: m = await ws.receive(timeout=0.5)
+                            except asyncio.TimeoutError: m = None
+                            if m is not None and m.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED,
+                                                            aiohttp.WSMsgType.CLOSING, aiohttp.WSMsgType.ERROR): break
+                            if not told and (m is not None or time.time() - opened > 2):
+                                self.q.put(("online", True)); told = True
+                            if m is not None and m.type == aiohttp.WSMsgType.TEXT:
+                                try: self.q.put(("msg", json.loads(m.data)))
+                                except ValueError: pass
+            except Exception: pass
+            if told: self.q.put(("online", False))
+            await asyncio.sleep(2)
+
+
+class Demo(threading.Thread):
+    """Fake data: idle, walk, run, idle, then disconnected (nap), repeating."""
+    def __init__(self, q): super().__init__(daemon=True); self.q = q
+
+    def run(self):
+        steps, fans = 0, 0
+        while True:
+            self.q.put(("online", True))
+            for gap, speed, secs in ((None, 0, 3), (0.55, 0.5, 6), (0.3, 0.95, 5), (None, 0, 3)):
+                fans = fans + 3 if fans < 14 else 1                   # listeners hop in, up past the "+N" limit
+                self.q.put(("msg", {"type": "listeners", "count": fans}))
+                end = time.time() + secs
+                while time.time() < end:
+                    if gap:                                           # same shape as the listen feed (openapi StepMessage)
+                        steps += 1
+                        self.q.put(("msg", {"type": "step", "data": {"step": steps, "gap": gap, "speed": speed, "out": speed,
+                                                                     "source": "phone"}}))
+                        time.sleep(gap)
+                    else: time.sleep(0.5)
+            self.q.put(("online", False)); time.sleep(6)
+
+
+# ---------------------------------------------------------------- the window
+class App:
+    def __init__(self, conf, source, win=None):
+        import tkinter as tk
+        self.tk, self.c, self.walker, self.q = tk, conf, Walker(), queue.Queue()
+        self.win, self.drag, self.cache, self.shown, self.lock_down = win or Win32(), None, {}, None, False
+        self.placed_crowd = (0, 0)
+        if IS_WINDOWS:
+            try: ctypes.windll.shcore.SetProcessDpiAwareness(2)
+            except Exception: pass
+        self.root = tk.Tk(); self.root.title("Dancing Chae"); self.root.overrideredirect(True)
+        self.root.attributes("-topmost", True); self.root.configure(bg=KEY)
+        try: self.root.attributes("-transparentcolor", KEY)
+        except tk.TclError: pass                                      # not supported off Windows
+        self.cv = tk.Canvas(self.root, bg=KEY, highlightthickness=0, bd=0); self.cv.pack(fill="both", expand=True)
+        self.cv.bind("<ButtonPress-1>", self.press); self.cv.bind("<B1-Motion>", self.move)
+        self.cv.bind("<ButtonRelease-1>", lambda e: save_conf(self.c))
+        self.cv.bind("<MouseWheel>", lambda e: self.resize(1 if e.delta > 0 else -1))
+        self.cv.bind("<Button-3>", self.menu)
+        source(self.q).start()
+        self.place(); self.draw(); self.root.update(); self.set_locked(self.c["locked"], save=False)
+        self.root.after(50, self.tick)
+
+    # ----- behaviour
+    def crowd(self):
+        """(fans drawn, extra listeners shown as "+N")."""
+        n = self.walker.listeners; shown = min(n, sprites.MAX_FANS); return shown, n - shown
+
+    @staticmethod
+    def label(extra): return f"+{extra}" if extra else ""
+
+    def crowd_w(self):
+        """Width (sprite pixels) of the audience to his left: the "+N" label, then the fans."""
+        shown, extra = self.crowd()
+        return len(self.label(extra)) * (sprites.DIGIT_W + 2) + shown * (sprites.FAN_W + 2) + (2 if shown else 0)
+
+    def size(self):
+        """Window size: the audience, then him, with headroom for the z's."""
+        s = self.c["scale"]
+        return (self.crowd_w() + sprites.W) * s, (sprites.H + sprites.HEADROOM) * s
+
+    def place(self):
+        """c["x"], c["y"] is where HE stands; the window grows to the left as listeners arrive, so he never moves."""
+        w, h = self.size()
+        if self.c["x"] is None:
+            self.c["x"], self.c["y"] = self.root.winfo_screenwidth() - sprites.W * self.c["scale"] - 40, self.root.winfo_screenheight() - h - 60
+        self.root.geometry(f'{w}x{h}+{int(self.c["x"]) - self.crowd_w() * self.c["scale"]}+{int(self.c["y"])}')
+
+    def set_locked(self, on, save=True):
+        self.c["locked"] = on; self.win.click_through(self.root.winfo_id(), on); self.shown = None; self.draw()
+        if save: save_conf(self.c)
+
+    def resize(self, d):
+        self.c["scale"] = max(MIN_SCALE, min(MAX_SCALE, self.c["scale"] + d)); self.place(); self.shown = None; self.draw(); save_conf(self.c)
+
+    def press(self, e): self.drag = (e.x_root - self.root.winfo_x(), e.y_root - self.root.winfo_y())
+
+    def move(self, e):
+        if self.drag and not self.c["locked"]:
+            left, self.c["y"] = e.x_root - self.drag[0], e.y_root - self.drag[1]
+            self.c["x"] = left + self.crowd_w() * self.c["scale"]
+            self.root.geometry(f"+{left}+{self.c['y']}")
+
+    def menu(self, e):
+        m = self.tk.Menu(self.root, tearoff=0)
+        m.add_command(label="Lock (click-through)  Ctrl+Alt+P", command=lambda: self.set_locked(True))
+        m.add_command(label="Bigger", command=lambda: self.resize(1)); m.add_command(label="Smaller", command=lambda: self.resize(-1))
+        m.add_separator(); m.add_command(label="Quit", command=self.quit)
+        m.tk_popup(e.x_root, e.y_root)
+
+    def quit(self): save_conf(self.c); self.root.destroy()
+
+    def tick(self):
+        try:
+            while True:
+                kind, val = self.q.get_nowait()
+                if kind == "online": self.walker.set_online(val)
+                else: self.walker.feed(val)
+        except queue.Empty: pass
+        if self.crowd() != self.placed_crowd: self.placed_crowd = self.crowd(); self.place()
+        combo = self.win.key_down(0x11) and self.win.key_down(0x12) and self.win.key_down(LOCK_VK)
+        if combo and not self.lock_down: self.set_locked(not self.c["locked"])
+        self.lock_down = combo
+        self.draw()
+        self.root.after(50, self.tick)
+
+    # ----- drawing
+    def image(self, rows):
+        """A Tk image of one frame at the current scale (pixels not put stay transparent)."""
+        key = (tuple(rows), self.c["scale"])
+        if key not in self.cache:
+            img = self.tk.PhotoImage(width=len(rows[0]), height=len(rows))
+            for y, row in enumerate(rows):                            # one put per run of same-coloured pixels
+                x = 0
+                while x < len(row):
+                    end = x
+                    while end < len(row) and row[end] == row[x]: end += 1
+                    if row[x] != ".": img.put(sprites.PALETTE[row[x]], to=(x, y, end, y + 1))
+                    x = end
+            self.cache[key] = img.zoom(self.c["scale"])
+        return self.cache[key]
+
+    def draw(self):
+        pose, i = self.walker.frame()
+        z = int(time.time() * 1.5) % 3 if pose == "sleep" else -1
+        cheer = int(time.time() * 4) if pose in ("walk", "run") else -1   # the crowd cheers while he moves
+        key = (pose, i, z, cheer, self.crowd())
+        if key == self.shown: return
+        self.shown = key; s = self.c["scale"]; w, h = self.size(); (shown, extra) = self.crowd()
+        self.cv.delete("all")
+        top, bottom, me = sprites.HEADROOM, sprites.H + sprites.HEADROOM, self.crowd_w()
+        self.cv.create_image(me * s, top * s, image=self.image(sprites.FRAMES[pose][i]), anchor="nw")
+        lx = 0                                                        # audience to his left: "+N" furthest out, then the fans
+        for ch in self.label(extra):
+            self.cv.create_image(lx * s, (bottom - sprites.DIGIT_H - 2) * s, image=self.image(sprites.DIGITS[ch]), anchor="nw")
+            lx += sprites.DIGIT_W + 2
+        for j in range(shown):                                        # fan 0 stands next to him, newer ones further left
+            up_ = cheer >= 0 and (cheer + j) % 2 == 0
+            fx = me - 2 - (j + 1) * (sprites.FAN_W + 2) + 2
+            self.cv.create_image(fx * s, (bottom - sprites.FAN_H - (2 if up_ else 0)) * s, image=self.image(sprites.fan(j, up_)), anchor="nw")
+        for zx, zy in sprites.Z_SPOTS[:z + 1]:                        # z's rise one by one while he naps
+            self.cv.create_image((me + zx) * s, (top + zy) * s, image=self.image(sprites.ZED), anchor="nw")
+        if not self.c["locked"]: self.cv.create_rectangle(1, 1, w - 2, h - 2, outline="#fbbf24", dash=(4, 3))
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description="Dancing Chae desktop walker")
+    ap.add_argument("--server", help=f"Chae WebSocket server to read openapi.json from (default {DEFAULTS['server']})")
+    ap.add_argument("--url", help="listen to this WebSocket directly instead of discovering it")
+    ap.add_argument("--demo", action="store_true", help="use fake data")
+    ap.add_argument("--scale", type=int, help=f"pixel size, {MIN_SCALE} to {MAX_SCALE} (default {DEFAULTS['scale']})")
+    ap.add_argument("--unlock", action="store_true", help="start unlocked so you can move him")
+    ap.add_argument("--reset", action="store_true", help="forget the saved position and settings")
+    a = ap.parse_args(argv)
+    conf = dict(DEFAULTS) if a.reset else load_conf()
+    if a.server: conf["server"] = a.server
+    if a.scale: conf["scale"] = a.scale
+    conf["scale"] = max(MIN_SCALE, min(MAX_SCALE, int(conf["scale"])))
+    if a.unlock or a.reset or not os.path.exists(CONF): conf["locked"] = False
+    app = App(conf, (lambda q: Demo(q)) if a.demo else (lambda q: Feed(q, conf["server"], a.url)))
+    print("Dancing Chae running.  Right-click for the menu, Ctrl+Alt+P lock/unlock", flush=True)
+    app.root.mainloop(); save_conf(conf)
+
+
+if __name__ == "__main__":
+    main()
