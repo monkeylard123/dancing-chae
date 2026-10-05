@@ -38,6 +38,21 @@ python walker.py --reset                      # forget the saved position and si
 
 Transparency and click-through use Windows APIs. On macOS/Linux he runs, but with a dark box behind him.
 
+## He's napping and Chae is walking?
+
+Right-click him: the first line of the menu says what he's doing and why (for example `Napping: Can't reach ...` with
+the error). Every connection attempt and error is also written to **`walker.log`** next to `walker.bat`; the menu has
+**Open walker.log**. Send that file along when asking for help.
+
+* **"Chae is disconnected from the server"**: he's right; Chae's WalkPad isn't connected right now.
+* **"Can't reach ..."**: the error says why. To use a different address for the same server, right-click
+  **Server: ... (change...)**; he reads that server's `openapi.json` and reconnects. It's remembered in `walker.json`.
+* **Started from an old copy?** Close him (right-click **Quit**), `git pull` or download the ZIP again, and start
+  `walker.bat` again. A running walker doesn't pick up new code.
+
+`walker.bat` checks on every start that `aiohttp` is installed in `.venv`, so a `.venv` made by something else (an
+editor, the tests) gets fixed instead of leaving him unable to connect.
+
 ## Where the data comes from
 
 He only ever finds the feed through the server's OpenAPI document. Before every (re)connect he reads
@@ -77,4 +92,5 @@ and the click-through calls (through a fake `user32`). Not covered: real transpa
 * `walker.py`: connection, pose logic, and the transparent window
 * `walker_sprites.py`: the art (palette, `paint()`, poses, fans, pixel font)
 * `walker.bat`: one-click setup and launch on Windows
+* `walker.log` (created when he runs): connection steps and errors
 * `tests/test_walker.py`: tests

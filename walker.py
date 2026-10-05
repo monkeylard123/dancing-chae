@@ -14,7 +14,7 @@ Ctrl+Alt+P locks/unlocks him; a locked walker is click-through.
 
 The sprite art lives in walker_sprites.py. Only needs tkinter and aiohttp (see requirements.txt).
 """
-import argparse, asyncio, ctypes, json, os, queue, sys, threading, time
+import argparse, asyncio, ctypes, json, logging, logging.handlers, os, queue, sys, threading, time
 
 import walker_sprites as sprites
 
@@ -23,7 +23,9 @@ KEY = "#010203"                     # this exact colour becomes fully transparen
 
 DEFAULTS = {"x": None, "y": None, "scale": 2, "locked": False, "server": "https://runchaerun.cactus.vg"}
 MIN_SCALE, MAX_SCALE = 1, 6
-CONF = os.path.join(os.environ.get("WALKER_DATA_DIR") or os.path.dirname(os.path.abspath(__file__)), "walker.json")
+DATA = os.environ.get("WALKER_DATA_DIR") or os.path.dirname(os.path.abspath(__file__))
+CONF, LOG = os.path.join(DATA, "walker.json"), os.path.join(DATA, "walker.log")
+log = logging.getLogger("walker")
 HOLD = 1.2          # keep walking this long after the last step (s)
 RUN_SPEED = 0.66    # speed above which he runs, unless a state message brings WalkPad's own cfg (walk_max + 0.01)
 FPS = {"idle": 2, "walk": 6, "run": 10, "sleep": 1}
@@ -154,40 +156,56 @@ class Feed(threading.Thread):
     """Listens to the WebSocket and reconnects forever. Only reports "online" once the connection proves itself
     (a message arrives or it stays open 2 s), so a server that accepts and instantly drops us doesn't wake him up.
     Where to listen always comes from the server's /openapi.json, queried again before every (re)connect;
-    if it can't be read or names no listen socket, he stays asleep and asks again."""
-    def __init__(self, q, server): super().__init__(daemon=True); self.q, self.server = q, server
+    if it can't be read or names no listen socket, he stays asleep and asks again.
+    Every step and error goes to walker.log and to the right-click menu ("status" messages), so a nap can be explained.
+    Setting .server switches servers: the current connection is dropped and the new server's openapi.json is read."""
+    def __init__(self, q, server): super().__init__(daemon=True); self.q, self.server, self.last = q, server, None
 
-    def run(self): asyncio.run(self.main())
+    def run(self):
+        try: asyncio.run(self.main())
+        except BaseException as e:                                    # e.g. aiohttp missing: say so instead of napping silently
+            self.say(f"Feed stopped: {type(e).__name__}: {e}", logging.ERROR)
 
-    async def resolve(self, s):
-        try:
-            async with s.get(self.server.rstrip("/") + "/openapi.json", timeout=10) as r:
-                return listen_url(await r.json(content_type=None), self.server) if r.status == 200 else None
-        except Exception: return None
+    def say(self, text, level=logging.INFO):
+        if text != self.last: log.log(level, text); self.last = text
+        self.q.put(("status", text))
+
+    async def resolve(self, s, server):
+        """The listen URL from server's openapi.json; raises with a readable reason if there isn't one."""
+        import aiohttp
+        doc = server.rstrip("/") + "/openapi.json"
+        async with s.get(doc, timeout=aiohttp.ClientTimeout(total=10)) as r:
+            if r.status != 200: raise ConnectionError(f"{doc} answered HTTP {r.status}")
+            url = listen_url(await r.json(content_type=None), server)
+        if url is None: raise ConnectionError(f"{doc} doesn't name a listen socket")
+        return url
 
     async def main(self):
         import aiohttp
         while True:
-            told = False
+            told, server = False, self.server
             try:
                 async with aiohttp.ClientSession() as s:
-                    url = await self.resolve(s)
-                    if url is None: raise ConnectionError("openapi.json has no listen socket")
+                    self.say(f"Reading {server.rstrip('/')}/openapi.json")
+                    url = await self.resolve(s, server)
+                    self.say(f"Connecting to {url}")
                     async with s.ws_connect(url, heartbeat=15) as ws:
                         opened = time.time()
-                        while True:
+                        while self.server == server:
                             try: m = await ws.receive(timeout=0.5)
                             except asyncio.TimeoutError: m = None
                             if m is not None and m.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED,
                                                             aiohttp.WSMsgType.CLOSING, aiohttp.WSMsgType.ERROR): break
                             if not told and (m is not None or time.time() - opened > 2):
-                                self.q.put(("online", True)); told = True
+                                self.q.put(("online", True)); told = True; self.say(f"Connected to {url}")
                             if m is not None and m.type == aiohttp.WSMsgType.TEXT:
                                 try: self.q.put(("msg", json.loads(m.data)))
                                 except ValueError: pass
-            except Exception: pass
+                        if self.server == server: self.say(f"{url} closed the connection", logging.WARNING)
+            except Exception as e:
+                self.say(f"Can't reach {server}: {type(e).__name__}: {e}".rstrip(": "), logging.WARNING)
             if told: self.q.put(("online", False))
-            await asyncio.sleep(2)
+            if self.server == server: await asyncio.sleep(2)
 
 
 class Demo(threading.Thread):
@@ -231,7 +249,8 @@ class App:
         self.cv.bind("<ButtonRelease-1>", lambda e: save_conf(self.c))
         self.cv.bind("<MouseWheel>", lambda e: self.resize(1 if e.delta > 0 else -1))
         self.cv.bind("<Button-3>", self.menu)
-        source(self.q).start()
+        self.status = None
+        self.feed = source(self.q); self.feed.start()
         self.place(); self.draw(); self.root.update(); self.set_locked(self.c["locked"], save=False)
         self.root.after(50, self.tick)
 
@@ -275,8 +294,27 @@ class App:
             self.c["x"] = left + self.crowd_w() * self.c["scale"]
             self.root.geometry(f"+{left}+{self.c['y']}")
 
+    def why(self):
+        """One line for the menu: what he's doing and why."""
+        w = self.walker
+        if w.online and w.chae is False: return "Napping: Chae is disconnected from the server"
+        if w.online: return "Connected" + (f", {w.listeners} listening" if w.listeners else "")
+        return "Napping: " + (self.status or "connecting...")
+
+    def change_server(self):
+        from tkinter import simpledialog
+        new = simpledialog.askstring("Dancing Chae", "Chae WebSocket server (its openapi.json is read):",
+                                     initialvalue=self.c["server"], parent=self.root)
+        if new and new.strip() and new.strip() != self.c["server"]:
+            self.c["server"] = new.strip(); save_conf(self.c); log.info("Server changed to %s", self.c["server"])
+            if hasattr(self.feed, "server"): self.feed.server = self.c["server"]
+
     def menu(self, e):
         m = self.tk.Menu(self.root, tearoff=0)
+        m.add_command(label=self.why()[:90], state="disabled")
+        m.add_command(label=f"Server: {self.c['server']}  (change...)", command=self.change_server)
+        m.add_command(label="Open walker.log", command=lambda: os.startfile(LOG) if IS_WINDOWS and os.path.exists(LOG) else None)
+        m.add_separator()
         m.add_command(label="Lock (click-through)  Ctrl+Alt+P", command=lambda: self.set_locked(True))
         m.add_command(label="Bigger", command=lambda: self.resize(1)); m.add_command(label="Smaller", command=lambda: self.resize(-1))
         m.add_separator(); m.add_command(label="Quit", command=self.quit)
@@ -289,7 +327,11 @@ class App:
             while True:
                 kind, val = self.q.get_nowait()
                 if kind == "online": self.walker.set_online(val)
-                else: self.walker.feed(val)
+                elif kind == "status": self.status = val
+                else:
+                    was = self.walker.chae; self.walker.feed(val)
+                    if self.walker.chae != was and self.walker.chae is not None:
+                        log.info("Chae is %s", "connected" if self.walker.chae else "disconnected")
         except queue.Empty: pass
         if self.crowd() != self.placed_crowd: self.placed_crowd = self.crowd(); self.place()
         combo = self.win.key_down(0x11) and self.win.key_down(0x12) and self.win.key_down(LOCK_VK)
@@ -350,6 +392,11 @@ def main(argv=None):
     if a.scale: conf["scale"] = a.scale
     conf["scale"] = max(MIN_SCALE, min(MAX_SCALE, int(conf["scale"])))
     if a.unlock or a.reset or not os.path.exists(CONF): conf["locked"] = False
+    try:
+        h = logging.handlers.RotatingFileHandler(LOG, maxBytes=200_000, backupCount=1, encoding="utf-8")
+        h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s")); log.addHandler(h); log.setLevel(logging.INFO)
+    except OSError: pass
+    log.info("Starting, server %s", conf["server"])
     app = App(conf, (lambda q: Demo(q)) if a.demo else (lambda q: Feed(q, conf["server"])))
     print("Dancing Chae running.  Right-click for the menu, Ctrl+Alt+P lock/unlock", flush=True)
     app.root.mainloop(); save_conf(conf)

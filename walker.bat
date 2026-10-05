@@ -2,8 +2,9 @@
 rem Double-click to start the desktop walker. The first run sets up a private Python environment (.venv).
 setlocal
 cd /d "%~dp0"
+set "MADE="
 
-if exist ".venv\Scripts\pythonw.exe" goto run
+if exist ".venv\Scripts\pythonw.exe" goto check
 
 set "PY="
 where py >nul 2>nul && set "PY=py -3"
@@ -16,6 +17,12 @@ if not defined PY (
 
 echo Setting up the walker for the first time...
 %PY% -m venv .venv || goto fail
+set "MADE=1"
+
+:check
+rem Also covers a .venv made by something else (an editor, the tests) that doesn't have aiohttp yet.
+".venv\Scripts\python.exe" -c "import aiohttp" >nul 2>nul && goto run
+echo Installing what the walker needs...
 ".venv\Scripts\python.exe" -m pip install --quiet --disable-pip-version-check -r requirements.txt || goto fail
 
 :run
@@ -24,6 +31,6 @@ exit /b 0
 
 :fail
 echo Setup failed. Delete the .venv folder and try again.
-rmdir /s /q .venv 2>nul
+if defined MADE rmdir /s /q .venv 2>nul
 pause
 exit /b 1
