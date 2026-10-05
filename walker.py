@@ -22,7 +22,8 @@ import walker_sprites as sprites
 IS_WINDOWS = sys.platform == "win32"
 KEY = "#010203"                     # this exact colour becomes fully transparent (Windows)
 
-DEFAULTS = {"x": None, "y": None, "scale": 2, "locked": False, "server": "https://runchaerun.cactus.vg"}
+DEFAULTS = {"x": None, "y": None, "scale": 2, "locked": False, "server": "https://runchaerun.cactus.vg", "name": None}
+NAME_CHARS = 24     # the server keeps at most this many characters of a name
 MIN_SCALE, MAX_SCALE = 1, 6
 DATA = os.environ.get("WALKER_DATA_DIR") or os.path.dirname(os.path.abspath(__file__))
 CONF, LOG = os.path.join(DATA, "walker.json"), os.path.join(DATA, "walker.log")
@@ -77,16 +78,18 @@ class Walker:
     def __init__(self):
         self.online, self.last_step, self.speed, self.run_speed, self.steps = False, None, 0.0, RUN_SPEED, None
         self.listeners, self.chae = 0, None          # chae: is Chae's WalkPad connected to the server (None = not told yet)
+        self.names = []                              # listener names in join order ("" = didn't give one)
         self.motion = deque()                        # (time, sample / step threshold) from the phone's sensor batches
 
     def set_online(self, on):
         """Whether WE are connected to the listen feed."""
         self.online = on
-        if not on: self.listeners, self.chae = 0, None; self.motion.clear()   # unknown until the server tells us again
+        if not on: self.listeners, self.chae, self.names = 0, None, []; self.motion.clear()   # unknown until told again
 
     def status(self, m):
         """The server's ConnectionMessage {"type": "connection", "data": {"connected": bool}} and ListenerCountMessage
-        {"type": "listeners", "data": {"count": n}} (see openapi.json). Returns True if m was one of them."""
+        {"type": "listeners", "data": {"count": n, "names": [...]}} (see openapi.json; servers before names existed
+        send only the count). Returns True if m was one of them."""
         if not isinstance(m, dict) or not isinstance(m.get("data"), dict): return False
         d = m["data"]
         if m.get("type") == "connection":
@@ -95,6 +98,8 @@ class Walker:
         if m.get("type") == "listeners":
             n = d.get("count")
             if isinstance(n, int) and not isinstance(n, bool) and n >= 0: self.listeners = n   # includes you, watching him
+            names = d.get("names")
+            self.names = [x[:NAME_CHARS] if isinstance(x, str) else "" for x in names] if isinstance(names, list) else []
             return True
         return False
 
@@ -210,7 +215,8 @@ class Feed(threading.Thread):
     if it can't be read or names no listen socket, he stays asleep and asks again.
     Every step and error goes to walker.log and to the right-click menu ("status" messages), so a nap can be explained.
     Setting .server switches servers: the current connection is dropped and the new server's openapi.json is read."""
-    def __init__(self, q, server): super().__init__(daemon=True); self.q, self.server, self.last = q, server, None
+    def __init__(self, q, server, name=None):
+        super().__init__(daemon=True); self.q, self.server, self.name, self.last = q, server, name, None
 
     def run(self):
         try: asyncio.run(self.main())
@@ -243,8 +249,10 @@ class Feed(threading.Thread):
                     url = await self.resolve(s, server)
                     self.say(f"Connecting to {url}")
                     async with s.ws_connect(url, heartbeat=15) as ws:
-                        opened = time.time()
+                        opened, sent = time.time(), None
                         while self.server == server:
+                            if self.name is not None and self.name != sent:      # tell the server who's watching
+                                await ws.send_str(json.dumps({"type": "hello", "name": self.name})); sent = self.name
                             try: m = await ws.receive(timeout=0.5)
                             except asyncio.TimeoutError: m = None
                             if m is not None and m.type in (aiohttp.WSMsgType.CLOSE, aiohttp.WSMsgType.CLOSED,
@@ -281,7 +289,8 @@ class Demo(threading.Thread):
             self.q.put(("online", True)); self.q.put(("msg", {"type": "connection", "data": {"connected": True}}))
             for gap, speed, secs in ((None, 0, 3), (0.55, 0.5, 6), (0.3, 0.95, 5), (None, 0, 3)):
                 fans = fans + 3 if fans < 14 else 1                   # listeners hop in, up past the "+N" limit
-                self.q.put(("msg", {"type": "listeners", "data": {"count": fans}}))
+                names = ["Alex", "Nick", "", "Chae's mum", "a very long name that gets shortened", "Sam", "Jo", "", "Kit", "Lee"]
+                self.q.put(("msg", {"type": "listeners", "data": {"count": fans, "names": (names * 2)[:fans]}}))
                 end = time.time() + secs
                 while time.time() < end:
                     if gap:                                           # same shape as the listen feed (openapi StepMessage)
@@ -298,7 +307,7 @@ class App:
         import tkinter as tk
         self.tk, self.c, self.walker, self.q = tk, conf, Walker(), queue.Queue()
         self.win, self.drag, self.cache, self.shown, self.lock_down = win or Win32(), None, OrderedDict(), None, False
-        self.placed_crowd = (0, 0)
+        self.placed_crowd, self.fonts = (0, 0), {}
         if IS_WINDOWS:
             try: ctypes.windll.shcore.SetProcessDpiAwareness(2)
             except Exception: pass
@@ -314,6 +323,7 @@ class App:
         self.status = None
         self.feed = source(self.q); self.feed.start()
         self.place(); self.draw(); self.root.update(); self.set_locked(self.c["locked"], save=False)
+        if self.c.get("name") is None and hasattr(self.feed, "name"): self.root.after(300, self.ask_name)   # first run
         self.root.after(50, self.tick)
 
     # ----- behaviour
@@ -325,9 +335,10 @@ class App:
     def label(extra): return f"+{extra}" if extra else ""
 
     def crowd_w(self):
-        """Width (sprite pixels) of the audience to his left: the "+N" label, then the fans."""
+        """Width (sprite pixels) of the audience to his left: the "+N" label, then the fans (with room for the
+        outermost fan's name tag to stick out)."""
         shown, extra = self.crowd()
-        return len(self.label(extra)) * (sprites.DIGIT_W + 2) + shown * (sprites.FAN_W + 2) + (2 if shown else 0)
+        return len(self.label(extra)) * (sprites.DIGIT_W + 2) + shown * (sprites.FAN_W + 2) + (2 + sprites.FAN_W if shown else 0)
 
     def size(self):
         """Window size: the audience, then him, with headroom for the z's."""
@@ -363,6 +374,16 @@ class App:
         if w.online: return "Connected" + (f", {w.listeners} listening" if w.listeners else "")
         return "Napping: " + (self.status or "connecting...")
 
+    def ask_name(self):
+        """Asks who's watching; the name labels you in Chae's audience. Cancel keeps the current one."""
+        from tkinter import simpledialog
+        new = simpledialog.askstring("Dancing Chae", "What's your name? It labels you in Chae's audience:",
+                                     initialvalue=self.c.get("name") or "", parent=self.root)
+        if new is None: return
+        self.c["name"] = " ".join(new.split())[:NAME_CHARS]; save_conf(self.c); log.info("Name set to %r", self.c["name"])
+        if hasattr(self.feed, "name"): self.feed.name = self.c["name"]
+        self.shown = None
+
     def change_server(self):
         from tkinter import simpledialog
         new = simpledialog.askstring("Dancing Chae", "Chae WebSocket server (its openapi.json is read):",
@@ -374,6 +395,7 @@ class App:
     def menu(self, e):
         m = self.tk.Menu(self.root, tearoff=0)
         m.add_command(label=self.why()[:90], state="disabled")
+        m.add_command(label=f"Name: {self.c.get('name') or '(none)'}  (change...)", command=self.ask_name)
         m.add_command(label=f"Server: {self.c['server']}  (change...)", command=self.change_server)
         m.add_command(label="Open walker.log", command=lambda: os.startfile(LOG) if IS_WINDOWS and os.path.exists(LOG) else None)
         m.add_separator()
@@ -420,11 +442,23 @@ class App:
             self.cache[key] = img.zoom(self.c["scale"])
         return self.cache[key]
 
+    def tag(self, text, x, y, width, mine=False):
+        """A name label centred at x with its bottom at y, shortened to fit width; yours is gold."""
+        import tkinter.font as tkf
+        px = max(9, int(5 * self.c["scale"]))
+        f = self.fonts.get(px) or self.fonts.setdefault(px, tkf.Font(family="Segoe UI" if IS_WINDOWS else "DejaVu Sans", size=-px, weight="bold"))
+        if f.measure(text) > width:
+            while text and f.measure(text + "...") > width: text = text[:-1]
+            text += "..."
+        for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1), (1, 1)):        # dark outline so it reads on any wallpaper
+            self.cv.create_text(x + dx, y + dy, text=text, font=f, fill="#111111", anchor="s")
+        self.cv.create_text(x, y, text=text, font=f, fill="#fbbf24" if mine else "#ffffff", anchor="s")
+
     def draw(self):
         pose, i, detail = self.walker.look()
         z = int(time.time() * 1.5) % 3 if pose == "sleep" else -1
         cheer = int(time.time() * 4) if pose in ("walk", "run") else -1   # the crowd cheers while he moves
-        key = (pose, i, detail, z, cheer, self.crowd())
+        key = (pose, i, detail, z, cheer, self.crowd(), tuple(self.walker.names))
         if key == self.shown: return
         self.shown = key; s = self.c["scale"]; w, h = self.size(); (shown, extra) = self.crowd()
         self.cv.delete("all")
@@ -438,6 +472,9 @@ class App:
             up_ = cheer >= 0 and (cheer + j) % 2 == 0
             fx = me - 2 - (j + 1) * (sprites.FAN_W + 2) + 2
             self.cv.create_image(fx * s, (bottom - sprites.FAN_H - (2 if up_ else 0)) * s, image=self.image(sprites.fan(j, up_)), anchor="nw")
+            if j < len(self.walker.names) and self.walker.names[j]:  # name tag above the fan, alternating heights so they fit
+                self.tag(self.walker.names[j], (fx + sprites.FAN_W / 2) * s, (bottom - sprites.FAN_H - 4 - 9 * (j % 2)) * s,
+                         2 * (sprites.FAN_W + 2) * s, mine=self.walker.names[j] == self.c.get("name"))
         for zx, zy in sprites.Z_SPOTS[:z + 1]:                        # z's rise one by one while he naps
             self.cv.create_image((me + zx) * s, (top + zy) * s, image=self.image(sprites.ZED), anchor="nw")
         if not self.c["locked"]: self.cv.create_rectangle(1, 1, w - 2, h - 2, outline="#fbbf24", dash=(4, 3))
@@ -461,7 +498,7 @@ def main(argv=None):
         h.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s")); log.addHandler(h); log.setLevel(logging.INFO)
     except OSError: pass
     log.info("Starting, server %s", conf["server"])
-    app = App(conf, (lambda q: Demo(q)) if a.demo else (lambda q: Feed(q, conf["server"])))
+    app = App(conf, (lambda q: Demo(q)) if a.demo else (lambda q: Feed(q, conf["server"], conf.get("name"))))
     print("Dancing Chae running.  Right-click for the menu, Ctrl+Alt+P lock/unlock", flush=True)
     app.root.mainloop(); save_conf(conf)
 

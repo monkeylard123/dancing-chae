@@ -11,7 +11,7 @@ driven live by the step feed from [WalkPad (moovit)](https://github.com/chaepr/m
 | no step for 1.2 s | stands around, blinking now and then |
 | Chae shuffles or sways without a counted step | bobs and fidgets on the spot |
 | Chae is disconnected from the server (or he can't reach the server) | sits down for a nap, with z's rising |
-| people are listening (you included) | a little audience gathers to his left and cheers while he moves (10 fans, then `+N`) |
+| people are listening (you included) | a little audience gathers to his left and cheers while he moves (10 fans, then `+N`), each labelled with the name they gave; yours is gold |
 
 ## Run it (Windows)
 
@@ -22,9 +22,12 @@ driven live by the step feed from [WalkPad (moovit)](https://github.com/chaepr/m
 The first run takes a few seconds while it sets up its own environment in `.venv` (it only installs `aiohttp`).
 After that he starts straight away, with no console window.
 
-The first time, he's **unlocked** (dashed outline): drag him where you want him, scroll the mouse wheel to resize him,
+The first time, he asks for **your name**: it labels you in the audience on everyone's screen (right-click
+**Name: ... (change...)** to change it later; leave it empty to stay unnamed).
+
+He also starts **unlocked** (dashed outline): drag him where you want him, scroll the mouse wheel to resize him,
 and right-click for a menu. Press **Ctrl+Alt+P** to lock him: a locked walker is click-through, so he never gets in your way.
-Press Ctrl+Alt+P again to unlock him. Position and size are saved to `walker.json`.
+Press Ctrl+Alt+P again to unlock him. Your name, position and size are saved to `walker.json`.
 
 ### Without the .bat
 
@@ -65,8 +68,10 @@ Messages he uses (schemas in `openapi.json`):
 
 * `{"type": "connection", "data": {"connected": true|false}}`: whether Chae's WalkPad is connected to the server.
   While it's `false` he naps. The server sends it as soon as he connects and again whenever Chae connects or disconnects.
-* `{"type": "listeners", "data": {"count": n}}`: how many walkers/listeners are connected, yours included. Each one
-  is a fan in the audience, so you always see yourself.
+* `{"type": "listeners", "data": {"count": n, "names": [...]}}`: everyone listening, yours included, in the order
+  they connected, with the name each one gave (`""` = none). Each is a fan in the audience, so you always see yourself.
+* he sends `{"type": "hello", "name": "..."}` after connecting (and again when you rename yourself); the server
+  cleans the name up and keeps 24 characters.
 * `{"type": "step", "data": {"step", "speed", "gap", ...}}` and `{"type": "state", "data": {...}}`: Chae's steps and
   WalkPad's state. A state message's `cfg.walk_max` replaces the default run threshold. Bare step objects (what older
   server versions relayed) and WalkPad's bare state also work.

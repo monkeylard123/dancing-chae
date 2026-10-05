@@ -216,3 +216,53 @@ def test_every_detail_combination_draws_a_full_size_frame():
                 for bob in (-2, 2):
                     check(list(sprites.pick(pose, i, stride=stride, arms=6, bob=bob)), sprites.W, sprites.H)
     for fidget in (-1, 1): check(list(sprites.pick("idle", 0, bob=-2, fidget=fidget)), sprites.W, sprites.H)
+
+
+# ---------- listener names ----------
+def test_listener_names_come_with_the_count():
+    w = walker.Walker(); w.set_online(True)
+    w.feed({"type": "listeners", "data": {"count": 3, "names": ["Alex", "", "Nick"]}})
+    assert w.listeners == 3 and w.names == ["Alex", "", "Nick"]
+    w.feed({"type": "listeners", "data": {"count": 1}})                  # a server from before names existed
+    assert w.listeners == 1 and w.names == []
+
+
+def test_odd_names_are_made_safe():
+    w = walker.Walker(); w.set_online(True)
+    w.feed({"type": "listeners", "data": {"count": 3, "names": [None, 5, "x" * 100]}})
+    assert w.names == ["", "", "x" * walker.NAME_CHARS]
+    w.feed({"type": "listeners", "data": {"count": 2, "names": "Alex"}}); assert w.names == []
+
+
+def test_names_are_forgotten_when_we_lose_the_feed():
+    w = walker.Walker(); w.set_online(True); w.feed({"type": "listeners", "data": {"count": 1, "names": ["Alex"]}})
+    w.set_online(False); assert w.names == []
+
+
+def test_the_feed_says_hello_with_your_name():
+    import asyncio, json, queue
+    from aiohttp import web
+
+    async def scenario():
+        got = []
+        async def doc(request):
+            return web.json_response({"paths": {"/ws/listen": {"get": {"x-websocket-messages": [{"direction": "server-to-client"}]}}}})
+        async def listen(request):
+            ws = web.WebSocketResponse(); await ws.prepare(request)
+            async for m in ws:
+                got.append(json.loads(m.data))
+                if len(got) == 2: await ws.close()
+            return ws
+        app = web.Application(); app.router.add_get("/openapi.json", doc); app.router.add_get("/ws/listen", listen)
+        runner = web.AppRunner(app); await runner.setup(); site = web.TCPSite(runner, "127.0.0.1", 0); await site.start()
+        port = site._server.sockets[0].getsockname()[1]
+        feed = walker.Feed(queue.Queue(), f"http://127.0.0.1:{port}", "Alex")
+        task = asyncio.ensure_future(feed.main())
+        for _ in range(50):
+            await asyncio.sleep(0.1)
+            if got and feed.name == "Alex": feed.name = "Big Nick"         # renaming sends another hello
+            if len(got) >= 2: break
+        task.cancel(); await runner.cleanup()
+        return got
+
+    assert asyncio.run(scenario())[:2] == [{"type": "hello", "name": "Alex"}, {"type": "hello", "name": "Big Nick"}]
