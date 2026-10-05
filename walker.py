@@ -232,16 +232,13 @@ class Feed(threading.Thread):
         return url
 
     async def main(self):
-        import aiohttp
-        import asyncio
-        import certifi
-        import ssl
+        import aiohttp, certifi, ssl
+        # certifi's certificate list: some Python installs can't verify the server's HTTPS certificate otherwise
         ssl_context = ssl.create_default_context(cafile=certifi.where())
-        connector = aiohttp.TCPConnector(ssl=ssl_context)
         while True:
             told, server = False, self.server
-            try:
-                async with aiohttp.ClientSession(connector=connector) as s:
+            try:                                                      # a session closes its connector, so a new one each try
+                async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(ssl=ssl_context)) as s:
                     self.say(f"Reading {server.rstrip('/')}/openapi.json")
                     url = await self.resolve(s, server)
                     self.say(f"Connecting to {url}")

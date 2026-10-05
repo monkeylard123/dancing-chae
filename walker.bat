@@ -20,8 +20,8 @@ echo Setting up the walker for the first time...
 set "MADE=1"
 
 :check
-rem Also covers a .venv made by something else (an editor, the tests) that doesn't have aiohttp yet.
-".venv\Scripts\python.exe" -c "import aiohttp" >nul 2>nul && goto run
+rem Also covers a .venv made by something else (an editor, the tests), or one from before a requirement was added.
+".venv\Scripts\python.exe" -c "import aiohttp, certifi" >nul 2>nul && goto run
 echo Installing what the walker needs...
 ".venv\Scripts\python.exe" -m pip install --quiet --disable-pip-version-check -r requirements.txt || goto fail
 
