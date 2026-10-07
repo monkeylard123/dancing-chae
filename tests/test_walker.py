@@ -318,3 +318,37 @@ def test_turned_frames_stay_full_size_and_show_his_back():
         check(list(sprites.pick("idle", 0, turn=a)), sprites.W, sprites.H)
     side = sprites.pick("idle", 0, turn=90)
     assert max(len(r.strip(".")) for r in side) < 10                      # edge-on he's a sliver
+
+
+# ---------- the RPG look ----------
+import walker_rpg as rpg
+
+
+def test_rpg_frames_are_full_size_with_known_colours_in_every_direction():
+    for pose, n in rpg.PHASES.items():
+        assert n == sprites.PHASES[pose]                                   # the walker animates both looks the same way
+        for i in range(n):
+            for turn in (0, 90, 180, -90):
+                check(list(rpg.pick(pose, i, turn=turn)), rpg.W, rpg.H)
+    check(list(rpg.pick("walk", 1, stride=8, bob=2, turn=45)), rpg.W, rpg.H)
+    check(list(rpg.pick("idle", 0, bob=-2, fidget=1)), rpg.W, rpg.H)
+
+
+def test_rpg_faces_the_way_chae_turned():
+    assert rpg.facing_to_direction(0) == "down"                            # the way Chae faced at Start: toward you
+    assert rpg.facing_to_direction(90) == "left"                           # Chae turned right: his right is your left
+    assert rpg.facing_to_direction(-90) == "right"
+    assert rpg.facing_to_direction(180) == rpg.facing_to_direction(-180) == "up"
+    assert rpg.facing_to_direction(40) == "down" and rpg.facing_to_direction(50) == "left"
+    down, left, up, right = (rpg.pick("walk", 1, turn=a) for a in (0, 90, 180, -90))
+    assert len({down, left, up, right}) == 4
+    assert [r[::-1] for r in rpg.frame_rows("walk", 1, "left")] == rpg.frame_rows("walk", 1, "right")
+
+
+def test_rpg_steps_hop_and_naps_sitting_down():
+    stand, step = rpg.pick("walk", 0), rpg.pick("walk", 1)
+    top = lambda rows: next(y for y, r in enumerate(rows) if r.strip("."))
+    assert top(step) < top(stand)                                          # a little hop on each step
+    assert top(rpg.pick("run", 1)) < top(step)                             # higher when running
+    assert top(rpg.pick("sleep", 0)) > top(stand)                          # sat down, lower
+    assert rpg.pick("sleep", 0, turn=180) == rpg.pick("sleep", 0)          # naps facing you whatever the heading

@@ -18,11 +18,16 @@ import argparse, asyncio, ctypes, json, logging, logging.handlers, math, os, que
 from collections import OrderedDict, deque
 
 import walker_sprites as sprites
+import walker_rpg
+
+LOOKS = {"classic": sprites, "rpg": walker_rpg}  # art styles: the same frames interface, picked in the menu or --look
+LOOK_NAMES = {"classic": "Classic (big, front-on)", "rpg": "RPG (tiny, four directions)"}
 
 IS_WINDOWS = sys.platform == "win32"
 KEY = "#010203"                     # this exact colour becomes fully transparent (Windows)
 
-DEFAULTS = {"x": None, "y": None, "scale": 2, "locked": False, "server": "https://runchaerun.cactus.vg", "name": None}
+DEFAULTS = {"x": None, "y": None, "scale": 2, "locked": False, "server": "https://runchaerun.cactus.vg", "name": None,
+            "look": "classic"}
 NAME_CHARS = 24     # the server keeps at most this many characters of a name
 MIN_SCALE, MAX_SCALE = 1, 6
 DATA = os.environ.get("WALKER_DATA_DIR") or os.path.dirname(os.path.abspath(__file__))
@@ -324,8 +329,8 @@ class Demo(threading.Thread):
                         steps += 1
                         self.q.put(("msg", {"type": "step", "data": {"step": steps, "gap": gap, "speed": speed, "out": speed,
                                                                      "source": "phone"}}))
-                    first_idle = gap is None and secs == 3 and time.time() < end - 1.5
-                    self.motion(gap, 1.4 if gap and gap < 0.4 else 1.0, gap or 0.5, 360 if first_idle else 0)   # a full pivot
+                    pivot = gap is None and secs == 3 and time.time() < end - 2          # standing: one full turn, 1 s
+                    self.motion(gap, 1.4 if gap and gap < 0.4 else 1.0, gap or 0.5, 360 if pivot else 0)
             self.q.put(("msg", {"type": "connection", "data": {"connected": False}})); time.sleep(6)
 
 
@@ -336,6 +341,7 @@ class App:
         self.tk, self.c, self.walker, self.q = tk, conf, Walker(), queue.Queue()
         self.win, self.drag, self.cache, self.shown, self.lock_down = win or Win32(), None, OrderedDict(), None, False
         self.placed_crowd, self.fonts = (0, 0), {}
+        self.look = LOOKS.get(self.c.get("look"), sprites)
         if IS_WINDOWS:
             try: ctypes.windll.shcore.SetProcessDpiAwareness(2)
             except Exception: pass
@@ -371,13 +377,13 @@ class App:
     def size(self):
         """Window size: the audience, then him, with headroom for the z's."""
         s = self.c["scale"]
-        return (self.crowd_w() + sprites.W) * s, (sprites.H + sprites.HEADROOM) * s
+        return (self.crowd_w() + self.look.W) * s, (self.look.H + self.look.HEADROOM) * s
 
     def place(self):
         """c["x"], c["y"] is where HE stands; the window grows to the left as listeners arrive, so he never moves."""
         w, h = self.size()
         if self.c["x"] is None:
-            self.c["x"], self.c["y"] = self.root.winfo_screenwidth() - sprites.W * self.c["scale"] - 40, self.root.winfo_screenheight() - h - 60
+            self.c["x"], self.c["y"] = self.root.winfo_screenwidth() - self.look.W * self.c["scale"] - 40, self.root.winfo_screenheight() - h - 60
         self.root.geometry(f'{w}x{h}+{int(self.c["x"]) - self.crowd_w() * self.c["scale"]}+{int(self.c["y"])}')
 
     def set_locked(self, on, save=True):
@@ -412,6 +418,13 @@ class App:
         if hasattr(self.feed, "name"): self.feed.name = self.c["name"]
         self.shown = None
 
+    def set_look(self, name):
+        """Switch art style, keeping his feet where they were."""
+        if name not in LOOKS or name == self.c.get("look"): return
+        old = self.look; self.look = LOOKS[name]; self.c["look"] = name
+        if self.c["y"] is not None: self.c["y"] += ((old.H + old.HEADROOM) - (self.look.H + self.look.HEADROOM)) * self.c["scale"]
+        self.cache.clear(); self.shown = None; self.place(); self.draw(); save_conf(self.c); log.info("Look changed to %s", name)
+
     def change_server(self):
         from tkinter import simpledialog
         new = simpledialog.askstring("Dancing Chae", "Chae WebSocket server (its openapi.json is read):",
@@ -424,6 +437,10 @@ class App:
         m = self.tk.Menu(self.root, tearoff=0)
         m.add_command(label=self.why()[:90], state="disabled")
         m.add_command(label=f"Name: {self.c.get('name') or '(none)'}  (change...)", command=self.ask_name)
+        looks = self.tk.Menu(m, tearoff=0)
+        for key, label in LOOK_NAMES.items():
+            looks.add_command(label=("* " if key == self.c.get("look") else "   ") + label, command=lambda k=key: self.set_look(k))
+        m.add_cascade(label="Look", menu=looks)
         m.add_command(label=f"Server: {self.c['server']}  (change...)", command=self.change_server)
         m.add_command(label="Open walker.log", command=lambda: os.startfile(LOG) if IS_WINDOWS and os.path.exists(LOG) else None)
         m.add_separator()
@@ -490,8 +507,8 @@ class App:
         if key == self.shown: return
         self.shown = key; s = self.c["scale"]; w, h = self.size(); (shown, extra) = self.crowd()
         self.cv.delete("all")
-        top, bottom, me = sprites.HEADROOM, sprites.H + sprites.HEADROOM, self.crowd_w()
-        self.cv.create_image(me * s, top * s, image=self.image(sprites.pick(pose, i, **dict(detail))), anchor="nw")
+        top, bottom, me = self.look.HEADROOM, self.look.H + self.look.HEADROOM, self.crowd_w()
+        self.cv.create_image(me * s, top * s, image=self.image(self.look.pick(pose, i, **dict(detail))), anchor="nw")
         lx = 0                                                        # audience to his left: "+N" furthest out, then the fans
         for ch in self.label(extra):
             self.cv.create_image(lx * s, (bottom - sprites.DIGIT_H - 2) * s, image=self.image(sprites.DIGITS[ch]), anchor="nw")
@@ -503,7 +520,7 @@ class App:
             if j < len(self.walker.names) and self.walker.names[j]:  # name tag above the fan, alternating heights so they fit
                 self.tag(self.walker.names[j], (fx + sprites.FAN_W / 2) * s, (bottom - sprites.FAN_H - 4 - 9 * (j % 2)) * s,
                          2 * (sprites.FAN_W + 2) * s, mine=self.walker.names[j] == self.c.get("name"))
-        for zx, zy in sprites.Z_SPOTS[:z + 1]:                        # z's rise one by one while he naps
+        for zx, zy in self.look.Z_SPOTS[:z + 1]:                      # z's rise one by one while he naps
             self.cv.create_image((me + zx) * s, (top + zy) * s, image=self.image(sprites.ZED), anchor="nw")
         if not self.c["locked"]: self.cv.create_rectangle(1, 1, w - 2, h - 2, outline="#fbbf24", dash=(4, 3))
 
@@ -512,12 +529,15 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="Dancing Chae desktop walker")
     ap.add_argument("--server", help=f"Chae WebSocket server to read openapi.json from (default {DEFAULTS['server']})")
     ap.add_argument("--demo", action="store_true", help="use fake data")
+    ap.add_argument("--look", choices=sorted(LOOKS), help="art style (also in the right-click menu)")
     ap.add_argument("--scale", type=int, help=f"pixel size, {MIN_SCALE} to {MAX_SCALE} (default {DEFAULTS['scale']})")
     ap.add_argument("--unlock", action="store_true", help="start unlocked so you can move him")
     ap.add_argument("--reset", action="store_true", help="forget the saved position and settings")
     a = ap.parse_args(argv)
     conf = dict(DEFAULTS) if a.reset else load_conf()
     if a.server: conf["server"] = a.server
+    if a.look: conf["look"] = a.look
+    if conf.get("look") not in LOOKS: conf["look"] = "classic"
     if a.scale: conf["scale"] = a.scale
     conf["scale"] = max(MIN_SCALE, min(MAX_SCALE, int(conf["scale"])))
     if a.unlock or a.reset or not os.path.exists(CONF): conf["locked"] = False

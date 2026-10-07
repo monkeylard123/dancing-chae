@@ -37,6 +37,7 @@ pip install -r requirements.txt
 python walker.py                              # live feed
 python walker.py --demo                       # fake data: a pivot, walk, run, nap, with motion and a growing audience
 python walker.py --scale 3                    # bigger (1 to 6, default 2)
+python walker.py --look rpg                   # the tiny RPG-style look (also: right-click > Look)
 python walker.py --server https://other.host  # another Chae WebSocket server (found through its openapi.json)
 python walker.py --reset                      # forget the saved position and size
 ```
@@ -90,7 +91,21 @@ Messages he uses (schemas in `openapi.json`):
   Chae can face his forward direction and tap Reset session to re-centre it. Without heading data he always faces you.
 * anything else is ignored.
 
-## Changing how he looks
+## Looks
+
+Right-click him and pick a **Look** (or start with `--look classic` / `--look rpg`); it's remembered in `walker.json`.
+
+* **Classic** (`walker_sprites.py`): the big front-on pixel Chae, 64x112. When Chae turns he spins round like a
+  paper cut-out.
+* **RPG** (`walker_rpg.py`): a tiny 16x24 overworld sprite, like an old-school RPG hero, drawn 4x bigger. He walks
+  toward you, away from you, left and right: which way follows Chae's turning (the way Chae faced at Start is toward
+  you, turning right makes him face your left, and so on). He hops on each step, higher when running and when Chae
+  steps harder, and naps sitting down. His art is plain 16x24 character grids at the top of `walker_rpg.py`.
+
+Every look has the same interface (`W`, `H`, `HEADROOM`, `PHASES`, `Z_SPOTS`, `pick()`), so a new style is one new
+module plus a line in `LOOKS` in `walker.py`.
+
+## Changing how the classic look looks
 
 He is 64x112 pixels, painted from simple shapes in `paint()` in [`walker_sprites.py`](walker_sprites.py). Every
 shape gets a 1-pixel outline automatically. Edit the coordinates and the `PALETTE` colours there; the poses
@@ -109,7 +124,8 @@ and the click-through calls (through a fake `user32`). Not covered: real transpa
 ## Files
 
 * `walker.py`: connection, pose logic, and the transparent window
-* `walker_sprites.py`: the art (palette, `paint()`, poses, fans, pixel font)
+* `walker_sprites.py`: the classic look's art (palette, `paint()`, poses), plus the fans and pixel font
+* `walker_rpg.py`: the RPG look's art and animation
 * `walker.bat`: one-click setup and launch on Windows
 * `walker.log` (created when he runs): connection steps and errors
 * `tests/test_walker.py`: tests
